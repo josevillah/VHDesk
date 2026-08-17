@@ -5,3 +5,5 @@ target/
 .env
 *.key
 *.pem
+.commitmsg
+vcpkg_installed/

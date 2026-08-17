@@ -1,0 +1,20 @@
+[package]
+name = "vhdesk-libvpx-sys"
+description = "Enlaces FFI a libvpx, generados con bindgen para el objetivo real de compilacion."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+# Declara que este crate envuelve la biblioteca nativa `vpx`. Cargo usa esto para impedir
+# que dos crates distintos del grafo intenten enlazarla a la vez con configuraciones
+# incompatibles.
+links = "vpx"
+
+[dependencies]
+
+[build-dependencies]
+bindgen.workspace = true
+pkg-config.workspace = true

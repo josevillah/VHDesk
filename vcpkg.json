@@ -1,0 +1,9 @@
+{
+  "name": "vhdesk",
+  "version-string": "0.0.0",
+  "description": "Dependencias nativas de VHDesk. Ver docs/adr/0002-libvpx-en-windows.md",
+  "dependencies": [
+    "libvpx"
+  ],
+  "builtin-baseline": "94a541197763a4f449a1b91478df48c0584a6256"
+}

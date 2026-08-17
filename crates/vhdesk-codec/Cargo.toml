@@ -9,3 +9,18 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+vhdesk-libvpx-sys.workspace = true
+vhdesk-proto.workspace = true
+
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+yuv.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+vhdesk-capture.workspace = true
+yuv.workspace = true
+
+[[example]]
+name = "bench-yuv"

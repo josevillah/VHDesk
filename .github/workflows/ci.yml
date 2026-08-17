@@ -37,6 +37,38 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # libvpx. En Linux y macOS basta el paquete del sistema, que el build.rs de
+      # vhdesk-libvpx-sys localiza con pkg-config. Los enlaces FFI se generan con bindgen a
+      # partir de las cabeceras que haya, asi que no importa que la version difiera entre
+      # plataformas. Ver docs/adr/0002-libvpx-en-windows.md.
+      # `libclang-dev` es para bindgen, no para libvpx: sin el, el build.rs de
+      # vhdesk-libvpx-sys falla al no encontrar libclang.so.
+      - name: libvpx (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libvpx-dev pkg-config libclang-dev
+
+      - name: libvpx (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libvpx pkg-config
+
+      # En Windows no hay pkg-config, asi que se instala con vcpkg desde el manifiesto de
+      # la raiz (que fija la version con builtin-baseline) y se apuntan las variables.
+      - name: Cache de vcpkg (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_installed
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+
+      - name: libvpx (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --triplet x64-windows-static-md
+          $raiz = "$PWD\vcpkg_installed\x64-windows-static-md"
+          "VPX_LIB_DIR=$raiz\lib"     | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "VPX_INCLUDE_DIR=$raiz\include" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
       - name: Formato
         run: cargo fmt --all --check
 
