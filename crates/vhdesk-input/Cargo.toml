@@ -9,3 +9,23 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+vhdesk-proto.workspace = true
+
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tracing-subscriber.workspace = true
+
+# Los tests de inyeccion real comprueban con la propia API donde acabo el puntero y si una
+# tecla quedo hundida. Sin esto solo podrian verificar que la llamada no dio error, que es
+# justo lo que no basta aqui.
+[target.'cfg(windows)'.dev-dependencies]
+windows.workspace = true
+
+[[example]]
+name = "prueba-input"

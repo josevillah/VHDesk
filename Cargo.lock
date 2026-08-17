@@ -1368,6 +1368,14 @@ dependencies = [
 [[package]]
 name = "vhdesk-input"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+ "vhdesk-proto",
+ "windows",
+]
 
 [[package]]
 name = "vhdesk-libvpx-sys"

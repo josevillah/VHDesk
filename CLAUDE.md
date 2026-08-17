@@ -255,6 +255,11 @@ Anotados en la fase 0 para que no sorprendan después:
   de bloqueo desde una sesión de usuario normal. Fase 6.
 - **`uinput` en Linux** necesita regla udev o grupo `input`, y hay que declarar el
   dispositivo con `ABS_X`/`ABS_Y` para posicionamiento absoluto.
+- **La distribución de teclado que manda es la del host.** El protocolo lleva scancodes,
+  o sea teclas físicas, que es lo correcto para atajos y juegos y lo equivocado para
+  escribir texto: con viewer en español y host en inglés, la arroba sale distinta. La
+  salida es `KEYEVENTF_UNICODE` y ofrecer los dos modos, y exige una variante nueva de
+  `InputEvent` en el protocolo. Fase 5, documentado en `vhdesk-input`.
 - **Audio de sistema en macOS 13 a 14.6**: cpal no lo cubre; hará falta ScreenCaptureKit.
 - **Latencia del viewer**: si el vídeo pasa por el teselador de egui en lugar de subirse a
   textura desde un callback de wgpu, se pierde la latencia que fuimos a buscar.
@@ -520,7 +525,7 @@ contenido equiparable.
 
 ### 2026-08-17 — Fase 1, bloque C: transporte QUIC
 
-`vhdesk-transport` con los cuatro canales sobre una conexión QUIC real. 7 tests de
+`vhdesk-transport` con los cuatro canales sobre una conexión QUIC real. 9 tests de
 integración por loopback que corren en CI (conexión QUIC de verdad, con handshake TLS y
 socket UDP, dentro del propio test) más `examples/echo.rs` para la prueba entre dos
 procesos o dos máquinas.
@@ -539,8 +544,9 @@ autenticación mutua) y en el propio tipo `AcceptAnyServerCert`, que desaparece 
   que los separa es la **dirección**: el input va siempre viewer→host y el vídeo siempre
   host→viewer, así que en cada extremo solo puede llegar uno de los dos. Es una invariante
   del diseño en la que nos apoyamos para no gastar un byte de etiqueta por stream, y está
-  documentada en `Session`. Si algún día el host necesita otro unidireccional propio, hay
-  que meter la etiqueta antes.
+  documentada en `Session`. **Se rompe en los dos sentidos**: la transferencia de archivos
+  de la Fase 5 va viewer→host y obligará a meter una etiqueta de canal, igual que lo haría
+  un unidireccional nuevo del host.
 - **El tamaño máximo de datagrama medido es 1414 bytes.** Confirma que la forma del cursor
   (4 KB para uno de 32x32) no cabe y tiene que ir por el canal de control. Hay un test que
   lo fija: la posición pasa, la forma se rechaza con `DatagramTooLarge`.
@@ -585,7 +591,53 @@ fallaba. No era un fallo del transporte: la cola del receptor tiene profundidad 
 propósito, y el quinto se tiraba. El test se reescribió para consumir de forma intercalada,
 que es como funciona un viewer real.
 
-**Siguiente paso.** Bloque D: `InputInjector` con `SendInput`.
+### 2026-08-17 — Fase 1, bloque D: inyección de entrada
+
+`vhdesk-input` completo para Windows con `SendInput`. 20 tests puros que corren en CI y 3
+de inyección real marcados `#[ignore]`, porque secuestrarían el ratón de cualquiera que
+lance la suite.
+
+**El hallazgo del bloque: HID no es PS/2.** El protocolo lleva el usage ID de USB HID, que
+es el identificador neutral de tecla física, y `SendInput` con `KEYEVENTF_SCANCODE` quiere
+scancodes PS/2 del conjunto 1. Son espacios de nombres distintos y hace falta una tabla de
+~100 entradas. Se traduce en el crate de plataforma y no en el protocolo, porque `uinput` y
+`CGEvent` tienen cada uno el suyo y traducirían igual desde cualquier cosa que
+eligiéramos.
+
+**Y de ahí sale una decisión de diseño**: la tabla devuelve `(scancode, extendida)` en la
+misma entrada, no hay lista de extendidas aparte. No es cuestión de estilo: en el conjunto
+1 la extensión es un prefijo `E0` sobre el mismo scancode, así que **Ctrl izquierdo y
+derecho son ambos 0x1D**, y Alt izquierdo y derecho ambos 0x38. Con una lista separada
+indexada por scancode sería imposible distinguirlos. Hay un test que lo fija.
+
+**Coordenadas.** El denominador de la normalización es `ancho - 1`, no `ancho`: hay 1920
+posiciones pero 1919 intervalos. Con el denominador ingenuo, el último píxel de cada borde
+queda inalcanzable, y ahí viven el botón de inicio, la X de cerrar y las esquinas activas.
+Verificado con inyección real: las cuatro esquinas del escritorio se alcanzan **exactas**
+tras el viaje de ida y vuelta por Windows, y un punto interior cae dentro de un píxel.
+
+**Teclas pegadas.** El injector lleva registro de lo que hunde y `liberar_todo()` lo suelta
+todo en un solo lote de `SendInput`, que es atómico respecto a otros hilos: soltar Ctrl y
+Alt en llamadas separadas dejaría una ventana para atajos fantasma. El registro es un
+módulo puro que **devuelve** la lista de liberaciones en vez de ejecutarlas. Verificado con
+inyección real y `GetAsyncKeyState`: tras hundir Mayús y llamar a `liberar_todo()`, la
+tecla queda suelta de verdad. **El bloque E debe llamarlo** al cerrar sesión, al perder el
+foco la ventana del viewer y ante error de conexión.
+
+**Se comprueba el valor de retorno de `SendInput`.** Devuelve cuántos eventos insertó, y si
+son menos de los pedidos casi siempre es UIPI: hay una ventana elevada en primer plano. No
+da error, simplemente inserta menos, así que ignorarlo produce "a veces no responde el
+teclado" sin ninguna pista.
+
+**Limitaciones documentadas, no implementadas mal**: Pausa/Interrumpir es la secuencia
+`E1 1D 45 …` y no encaja en el modelo de un scancode por evento; y la distribución de
+teclado la pone el host (ver riesgos).
+
+**Anotado para el bloque E**: el viewer tiene que fusionar los movimientos de ratón. A 1000
+Hz solo cuenta la última posición, y no tiene sentido mandar más de uno por frame. Los
+botones no se fusionan nunca.
+
+**Siguiente paso.** Bloque E: juntar host y viewer.
 
 ## Métricas actuales
 
@@ -622,15 +674,20 @@ Latencia y ancho de banda siguen sin medir: no hay pipeline completo hasta el bl
 
 ### Pipeline completo sobre capturas reales de 1080p
 
-`bench-pipeline --release`, 300 muestras sobre 30 frames reales del escritorio, un hilo.
+`bench-pipeline --release`, última ejecución. 300 muestras de conversión y encode sobre 30
+frames reales, 300 de captura, keyframes forzados cada 15 frames para poder caracterizarlos.
 
-| etapa | media | p50 | p95 | p99 |
-|---|---|---|---|---|
-| BGRA→I420 | 6,04 ms | 5,67 | 8,63 | 9,86 |
-| encode VP8 inter | 10,26 ms | 9,82 | 15,00 | **17,13** |
-| encode VP8 keyframe | 44,78 ms | — | — | **59,44** (solo 2 muestras) |
-| copia del decodificado | 0,49 ms | 0,40 | 1,02 | 1,53 |
-| **conversión + encode** | **16,53 ms** | 15,42 | 21,86 | **27,30** |
+| etapa | media | p50 | p95 | p99 | n |
+|---|---|---|---|---|---|
+| staging: espera a la GPU | 3,14 ms | 2,81 | 5,73 | 9,18 | 300 |
+| staging: descarga a memoria | 0,86 ms | 0,82 | 1,01 | 2,03 | 300 |
+| BGRA→I420 (SIMD) | 1,39 ms | 1,26 | 2,43 | 2,95 | 300 |
+| encode VP8 inter | 13,19 ms | 12,38 | 19,23 | **20,34** | 280 |
+| encode VP8 keyframe | 40,30 ms | 40,25 | 42,60 | **55,34** | 20 |
+| copia del decodificado | 0,55 ms | 0,43 | 1,21 | 1,78 | 300 |
 
-Tamaño medio: keyframe 61 KB, inter 16 KB. Bitrate resultante 7,9 Mbps a 60 fps y 3,9 Mbps
-a 30 fps, por debajo del objetivo de 8000 kbps configurado.
+Tamaño medio: keyframe 97 KB, inter 10,8 KB. Bitrate 7,9 Mbps a 60 fps y 4,0 a 30 fps.
+
+> Estos números **sustituyen** a los de la primera medición del bloque B, que se tomaron con
+> la conversión escalar que ya está retirada. Una tabla que se contradice consigo misma es
+> peor que no tenerla.
