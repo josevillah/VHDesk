@@ -30,7 +30,7 @@ use windows::core::Interface;
 
 use crate::cursor::{CursorPosition, CursorShape, CursorUpdate, PointerShapeKind};
 use crate::error::CaptureError;
-use crate::frame::{CaptureEvent, Frame, MonitorId, MonitorInfo, MoveRect, Rect};
+use crate::frame::{CaptureEvent, CaptureTimings, Frame, MonitorId, MonitorInfo, MoveRect, Rect};
 use crate::pixels::copy_frame;
 use crate::pool::BufferPool;
 use crate::{ScreenCapturer, cursor};
@@ -539,6 +539,7 @@ impl DxgiCapturer {
         // FASE 4: con los dirty rects en la mano se puede copiar solo las regiones sucias
         // con CopySubresourceRegion en vez del frame entero. En la fase 1 la copia completa
         // esta bien y evita una fuente de bugs sutiles mientras el pipeline no funciona.
+        let inicio_copia = Instant::now();
         let staging = self.asegurar_staging(width, height)?.clone();
         // SAFETY: las dos texturas tienen el mismo formato y dimensiones (la de staging se
         // creo a partir de las del origen), que es lo que `CopyResource` exige.
@@ -553,7 +554,14 @@ impl DxgiCapturer {
         }
         .map_err(|e| envolver(e, "Map"))?;
 
+        // `Map` con acceso de lectura bloquea hasta que la GPU termina la copia, asi que
+        // todo lo anterior es espera y lo que viene despues es ancho de banda de memoria.
+        // Separarlos es lo unico que permite saber cual de los dos se puede mejorar.
+        let map_wait = inicio_copia.elapsed();
+
+        let inicio_descarga = Instant::now();
         let resultado = self.volcar_mapeado(&mapeado, width, height);
+        let download = inicio_descarga.elapsed();
 
         // SAFETY: `Unmap` cierra el mapeo abierto justo arriba sobre la misma textura y
         // subrecurso. Se llama siempre, tambien si el volcado fallo.
@@ -571,6 +579,7 @@ impl DxgiCapturer {
             stride: width as usize * 4,
             sequence: self.sequence,
             captured_at: capturado_en,
+            timings: CaptureTimings { map_wait, download },
             presented_at_qpc: info.LastPresentTime,
             full_refresh,
             accumulated_frames: info.AccumulatedFrames,

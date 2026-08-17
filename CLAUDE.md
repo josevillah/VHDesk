@@ -115,6 +115,106 @@ cargo run -p vhdesk-server      # FASE 3
 El nivel de trazas se controla con la variable de entorno `VHDESK_LOG` (por defecto
 `info`).
 
+## Objetivo de rendimiento de la Fase 1
+
+**Comprometido: 1080p30 por software. Abierto: 1080p60, pendiente de medir el throughput
+del pipeline concurrente en el bloque E.**
+
+Medido en release sobre capturas reales de 1080p (`bench-pipeline`). Las cifras varían
+entre ejecuciones porque el coste del encoder depende del contenido de la pantalla, así
+que se dan como rango observado en tres ejecuciones:
+
+| etapa | media | p99 |
+|---|---|---|
+| staging: espera a la GPU | 2,2–3,1 ms | 9,2–9,4 |
+| staging: descarga a memoria | 0,9–1,0 ms | 2,0–2,2 |
+| BGRA→I420 (SIMD) | 1,2–1,4 ms | 1,8–3,0 |
+| encode VP8 inter | 9,5–13,2 ms | 15,1–20,3 |
+| encode VP8 keyframe | 36,5–40,3 ms | 48,5–55,3 |
+
+**Throughput y latencia son cosas distintas y aquí se separan:**
+
+- **Throughput**: con las etapas en hilos concurrentes lo marca la etapa más lenta, que es
+  el encode: 9,5–13,2 ms de media dan un techo teórico de **76–105 fps**. En el p99
+  (15–20 ms) el techo baja a 49–66 fps. Por eso 60 fps queda **abierto**, no descartado:
+  depende de dónde caiga el throughput real con el pipeline montado.
+- **Latencia**: es la suma de las etapas más las colas, del orden de **16 ms** por frame
+  solo en el host, antes de red, decode y presentación. Esa es la cifra que se optimiza.
+
+**1080p30 se compromete** porque cabe con holgura incluso sin concurrencia: la suma de
+medias (~16 ms) ocupa la mitad del presupuesto de 33,3 ms.
+
+**Coste en CPU, que hay que contar en la cifra del host**: a 60 fps las tres etapas suman
+del orden de **0,8 núcleos** de CPU real (la espera a la GPU ocupa un hilo pero no quema
+CPU), repartidos en **tres hilos ocupados**. A 30 fps, ~0,4 núcleos. Ese coste es parte
+del precio de la concurrencia y no puede omitirse al comparar con 1080p30 en un solo hilo.
+
+**Problema abierto: los keyframes.** 36–40 ms de media y hasta 55 de p99 solo en encode, y
+pesan ~100 KB. Ver la decisión pendiente sobre keyframes bajo demanda en las notas del
+bloque E.
+
+## Criterio de diseño del pipeline: latencia, no throughput
+
+**Se optimiza para latencia.** Con etapas concurrentes los FPS los marca la etapa más
+lenta, pero la latencia es la suma de todas más lo que esperen en las colas. Tres etapas
+de 10 ms dan 100 fps y 30 ms de retardo: los FPS se ven bien en una gráfica y la sesión se
+siente mal.
+
+De ahí, tres reglas que el bloque E no puede romper:
+
+1. **Colas de capacidad 1 con descarte del frame viejo.** Nunca buffers profundos. En
+   vídeo en vivo un frame retrasado no vale nada, y encolarlo solo añade retardo a todos
+   los que vienen detrás.
+2. **Cuando se descarta un frame hay que acumular sus rectángulos sucios** sobre los del
+   siguiente. Son acumulativos desde el `AcquireNextFrame` anterior; tirarlos deja basura
+   en pantalla.
+3. **Se mide la latencia extremo a extremo, no los FPS.** Los FPS son un indicador
+   secundario que puede mejorar mientras la experiencia empeora.
+
+### Pendiente de evaluar en el bloque E: doble textura de staging
+
+La espera a la GPU son 3,14 ms de media y 9,18 de p99 **bloqueado sin hacer trabajo**. Con
+dos texturas de staging alternadas se puede emitir el `CopyResource` del frame N y mapear
+el del frame N-1, solapando la espera de la GPU con el trabajo de la CPU.
+
+**No confundir con la propuesta que se descartó.** Aquella buscaba ahorrar ancho de banda
+eliminando una pasada de copia, y el desglose demostró que el ancho de banda no era el
+término dominante. Esta no ahorra trabajo: lo **solapa**, y ataca justamente el término que
+sí resultó dominante.
+
+Coste: un frame más de latencia de pipeline, a cambio de quitar hasta 9 ms de bloqueo. Se
+decide en el bloque E, cuando haya medición extremo a extremo con la que valorar si el
+frame extra de latencia compensa.
+
+### Decisión pendiente del bloque E: keyframes bajo demanda
+
+**Propuesta: eliminar el keyframe periódico.** El vídeo va por streams QUIC **fiables**,
+así que no hay pérdida de paquetes de la que recuperarse; el keyframe cada N segundos es
+una costumbre heredada de transportes con pérdida. Los únicos disparadores reales son:
+
+- inicio de sesión o viewer nuevo,
+- `full_refresh` de la captura (cambio de resolución, reinicialización de la duplicación),
+- **un `RESET_STREAM` que descarte un frame** y rompa la cadena de referencias,
+- petición explícita del viewer, como red de seguridad ante cualquier desincronización.
+
+Revisado en busca de agujeros, y no encontré ninguno de peso. En particular **no hay
+deriva por acumulación de error**: en VP8 los bloques sin cambios se codifican como *skip*,
+que es una copia exacta de la referencia, y las zonas que sí cambian se recodifican de
+todos modos. El ahorro es grande: el tirón de 36–40 ms deja de ocurrir cada 4 segundos y
+pasa a ocurrir solo cuando ya hemos descartado un frame, que es un momento degradado de
+por sí.
+
+**Detalle de implementación que hay que atender**: hoy `kf_mode` es `VPX_KF_AUTO`, y en ese
+modo libvpx **inserta keyframes por su cuenta al detectar cambio de escena**, que en un
+escritorio es cada vez que se cambia de ventana. Para que "bajo demanda" signifique
+realmente eso hay que poner `VPX_KF_DISABLED` y forzar con `VPX_EFLAG_FORCE_KF`.
+
+**Relacionado, sin decidir**: si el transporte es fiable, `g_error_resilient` cuesta
+eficiencia de compresión a cambio de una robustez que ya da QUIC. Pero con descarte
+deliberado de frames sigue habiendo referencias rotas, y para eso el error resilient
+tampoco basta: hace falta el keyframe. **No tocarlo sin medir** compresión y tiempo de
+encode con y sin él.
+
 ## Estado de las fases
 
 | Fase | Descripción | Estado |
@@ -173,11 +273,20 @@ Anotados en la fase 0 para que no sorprendan después:
 ### Para el ADR de la Fase 4 (registrado, no decidido)
 
 - **Conversión de color en GPU con un compute shader.** El frame ya está en una textura
-  D3D11, así que convertir BGRA→I420 allí evitaría leer 8,3 MiB por frame hacia memoria de
-  sistema y devolvería solo los ~3,1 MiB del I420. Es la otra rama del árbol frente a la
-  conversión SIMD en CPU que ya está adoptada, y **no está descartada**: la CPU sigue
-  pagando el tránsito de memoria aunque la aritmética sea gratis. Comparar contra el
-  0,5–1,3 ms actual antes de decidir.
+  D3D11, así que convertir BGRA→I420 allí evitaría bajar 8,3 MiB por frame y devolvería
+  solo los ~3,1 MiB del I420. Es la otra rama del árbol frente a la conversión SIMD en CPU
+  que ya está adoptada, y **no está descartada**. Ataca además el término correcto: el
+  desglose del staging dice que la descarga a memoria son 0,86 ms y la **espera a la GPU
+  3,14 ms de media y 9,18 de p99**, así que reducir el volumen transferido a un 37% es más
+  prometedor que ahorrarse pasadas de CPU.
+- **Convertir directamente desde el puntero mapeado, sin buffer intermedio: medido y
+  descartado por ahora.** La idea era ahorrarse una pasada completa sobre 8,3 MiB. El
+  desglose dice que la parte direccionable (`download`, 0,86 ms de media) es pequeña, y lo
+  más que se ahorraría es la escritura al pool más la relectura en la conversión, por
+  debajo del umbral del 30% del coste de staging que se fijó de antemano. Además exigiría
+  mantener el `Map` abierto durante la conversión y probablemente doble textura de staging
+  para no frenar el siguiente `AcquireNextFrame`. Se reevalúa en la Fase 4 junto con la
+  conversión en GPU, que ataca el término dominante en vez de este.
 - **El encoder es ahora el cuello de botella, no la conversión.** Tras adoptar SIMD, el
   encode VP8 software se lleva la mayor parte del presupuesto. Eso reordena las prioridades
   de la Fase 4: el encoder por hardware pasa por delante de cualquier otra optimización.
@@ -393,9 +502,52 @@ contenido equiparable.
 **Conclusión**: la conversión deja de ser el cuello de botella y pasa a serlo el encode.
 1080p60 está más cerca pero sin confirmar.
 
-**Siguiente paso.** Bloque C: transporte QUIC con un eco de mensajes entre dos procesos.
+### 2026-08-17 — Fase 1, bloque C: transporte QUIC
+
+`vhdesk-transport` con los cuatro canales sobre una conexión QUIC real. 7 tests de
+integración por loopback que corren en CI (conexión QUIC de verdad, con handshake TLS y
+socket UDP, dentro del propio test) más `examples/echo.rs` para la prueba entre dos
+procesos o dos máquinas.
+
+**Verificado entre dos procesos** por loopback: ida y vuelta de control en 3,87 ms, 10/10
+eventos de input, 10/10 datagramas, 30/30 frames de vídeo, 0 descartados.
+
+**Sin autenticación, y marcado para que no se olvide.** Certificado autofirmado generado en
+cada arranque y verificador que acepta cualquiera. Hay `// FASE 2:` en el verificador, en
+`client_config_insecure`, en `server_config` (donde falta el verificador de cliente para la
+autenticación mutua) y en el propio tipo `AcceptAnyServerCert`, que desaparece entero.
+
+**Dos hallazgos del bloque:**
+
+- **`accept_uni` no distingue input de vídeo**, porque los dos son unidireccionales. Lo
+  que los separa es la **dirección**: el input va siempre viewer→host y el vídeo siempre
+  host→viewer, así que en cada extremo solo puede llegar uno de los dos. Es una invariante
+  del diseño en la que nos apoyamos para no gastar un byte de etiqueta por stream, y está
+  documentada en `Session`. Si algún día el host necesita otro unidireccional propio, hay
+  que meter la etiqueta antes.
+- **El tamaño máximo de datagrama medido es 1414 bytes.** Confirma que la forma del cursor
+  (4 KB para uno de 32x32) no cabe y tiene que ir por el canal de control. Hay un test que
+  lo fija: la posición pasa, la forma se rechaza con `DatagramTooLarge`.
+
+**Una trampa de la API que costó un test**: `Session` se clona barato pero **la conexión se
+cierra al soltar el último clon**. Mover la única `Session` a una tarea que después termina
+tira la conexión y se pierde lo que quedara en vuelo. Documentado en `Session`.
+
+**Siguiente paso.** Bloque D: `InputInjector` con `SendInput`.
 
 ## Métricas actuales
+
+> **Máquina de referencia de todas las mediciones**: Lenovo 82XM, AMD Ryzen 7 5825U con
+> **Radeon integrada**, 14 GB de RAM, Windows 11, monitor 1920x1080 al 125%. Compilado en
+> release con LTO fino.
+>
+> **Las cifras de staging no son generalizables.** En una GPU integrada la memoria es
+> compartida y `CopyResource` es esencialmente una copia dentro de la RAM del sistema: no
+> cruza PCIe. En una GPU dedicada ese mismo camino atraviesa el bus y el perfil puede ser
+> muy distinto, y no está claro en qué sentido: el bus añade latencia, pero una dedicada
+> tiene mucho más ancho de banda propio y puede terminar antes el `CopyResource`. **No
+> tomar estos números como universales al decidir nada de la Fase 4** hasta medirlos en una
+> máquina con GPU dedicada.
 
 Latencia y ancho de banda siguen sin medir: no hay pipeline completo hasta el bloque E.
 
@@ -408,8 +560,13 @@ Latencia y ancho de banda siguen sin medir: no hay pipeline completo hasta el bl
 | Captura: FPS sostenidos | 59,6 fps | 2026-08-17 | `dump-frames --release --frames 40 --no-save`, 1080p, Radeon integrada |
 | Captura: CPU por frame | ~1,2 ms | 2026-08-17 | `dump-frames --idle 20`, CPU del proceso / frames recibidos |
 | Captura: CPU en reposo | <1,25% de un núcleo | 2026-08-17 | `dump-frames --idle 20`; cota superior, la pantalla no estuvo del todo quieta |
-| BGRA→I420 a 1080p (SIMD, adoptado) | 0,51 ms caché caliente / 1,32 ms en pipeline | 2026-08-17 | `bench-yuv-simd` y `bench-pipeline`, release |
+| BGRA→I420 a 1080p (SIMD, adoptado) | 0,51 ms caché caliente / 1,39 ms en pipeline | 2026-08-17 | `bench-yuv-simd` y `bench-pipeline`, release |
 | BGRA→I420 a 1080p (escalar, retirado) | 5,54 ms/frame | 2026-08-17 | `bench-yuv-simd --release`, mismos frames |
+| Staging: espera a la GPU | 3,14 ms media / 9,18 p99 | 2026-08-17 | `bench-pipeline --release`, n=300; es espera, no CPU |
+| Staging: descarga a memoria | 0,86 ms media / 2,03 p99 | 2026-08-17 | ídem; esto sí es ancho de banda |
+| Encode VP8 inter a 1080p | 9,5–13,2 ms media / 15,1–20,3 p99 | 2026-08-17 | `bench-pipeline --release`, n=280; rango de 3 ejecuciones |
+| Encode VP8 keyframe a 1080p | 36,5–40,3 ms media / 48,5–55,3 p99 | 2026-08-17 | ídem, n=20 forzados |
+| Tamaño de frame comprimido | keyframe ~100 KB / inter ~10 KB | 2026-08-17 | ídem; 7,9 Mbps a 60 fps, 4,0 a 30 fps |
 
 ### Pipeline completo sobre capturas reales de 1080p
 

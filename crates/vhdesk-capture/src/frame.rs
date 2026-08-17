@@ -1,6 +1,6 @@
 //! Tipos que describen monitores, frames y lo que ocurre en cada ciclo de captura.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::cursor::CursorUpdate;
 use crate::pool::PooledBuffer;
@@ -108,6 +108,34 @@ pub struct MoveRect {
     pub destination: Rect,
 }
 
+/// Desglose del coste de bajar un frame de la GPU.
+///
+/// Se separan los dos sumandos porque responden a preguntas distintas y solo uno de ellos
+/// es optimizable desde aqui: el primero es esperar a la GPU y el segundo es ancho de
+/// banda de memoria. Confundirlos lleva a "optimizar" una copia que en realidad estaba
+/// esperando a otra cosa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CaptureTimings {
+    /// Copia a la textura intermedia mas el mapeo.
+    ///
+    /// El mapeo de lectura **bloquea hasta que la GPU termina la copia**, asi que este
+    /// tiempo es sobre todo espera, no trabajo de la CPU.
+    pub map_wait: Duration,
+    /// Lectura del mapeo y escritura al buffer del pool.
+    ///
+    /// Esto si es ancho de banda: se leen `stride * height` bytes de memoria mapeada de la
+    /// GPU, que es notablemente mas lenta que la memoria normal, y se escriben otros
+    /// tantos en el buffer del pool.
+    pub download: Duration,
+}
+
+impl CaptureTimings {
+    /// Coste total de bajar el frame.
+    pub fn total(&self) -> Duration {
+        self.map_wait + self.download
+    }
+}
+
 /// Un frame capturado.
 #[derive(Debug)]
 pub struct Frame {
@@ -128,6 +156,8 @@ pub struct Frame {
     pub sequence: u64,
     /// Momento en que se recogio el frame de la duplicacion.
     pub captured_at: Instant,
+    /// Desglose de lo que costo traer los pixeles de la GPU a memoria de sistema.
+    pub timings: CaptureTimings,
     /// Momento en que el sistema presento el frame, en unidades del contador de alta
     /// resolucion de Windows.
     ///
