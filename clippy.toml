@@ -1,0 +1,6 @@
+# vhdesk-proto decodifica bytes que vienen de la red: cualquier panico ahi es un DoS
+# remoto. Estas listas hacen que clippy senale las funciones que entran en panico.
+disallowed-methods = [
+    { path = "std::option::Option::unwrap", reason = "usa `ok_or`/`?`; en tests usa `expect` con mensaje" },
+    { path = "std::result::Result::unwrap", reason = "usa `?` o propaga el error con contexto" },
+]

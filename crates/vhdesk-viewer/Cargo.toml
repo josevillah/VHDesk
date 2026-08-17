@@ -1,0 +1,16 @@
+[package]
+name = "vhdesk-viewer"
+description = "Aplicacion de escritorio del lado que controla: decodifica, renderiza y envia input."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+vhdesk-proto.workspace = true
+
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
