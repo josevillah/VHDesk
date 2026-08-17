@@ -1,0 +1,20 @@
+[package]
+name = "vhdesk-server"
+description = "Servidor de rendezvous y relay ciego de VHDesk. Autohospedable."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# AGPL-3.0, no GPL-3.0 como el resto del workspace: esto es un servicio que se ofrece por
+# red, y la clausula de red es justamente lo que garantiza que quien lo despliegue
+# modificado publique sus cambios.
+license = "AGPL-3.0-only"
+
+[dependencies]
+vhdesk-proto.workspace = true
+
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

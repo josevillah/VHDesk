@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/vhdesk-proto",
+    "crates/vhdesk-crypto",
+    "crates/vhdesk-capture",
+    "crates/vhdesk-codec",
+    "crates/vhdesk-input",
+    "crates/vhdesk-audio",
+    "crates/vhdesk-transport",
+    "crates/vhdesk-host",
+    "crates/vhdesk-viewer",
+    "crates/vhdesk-server",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["VHDesk contributors"]
+repository = "https://github.com/josevillah/vhdesk"
+
+# Los binarios de escritorio son GPL-3.0. vhdesk-server sobreescribe este campo con
+# AGPL-3.0 en su propio manifiesto: es un servicio en red y la clausula de red importa.
+license = "GPL-3.0-only"
+
+# Version unica por dependencia para todo el workspace. Cada crate la hereda con
+# `dep.workspace = true`, de modo que no puedan divergir entre crates.
+[workspace.dependencies]
+vhdesk-proto = { path = "crates/vhdesk-proto" }
+vhdesk-crypto = { path = "crates/vhdesk-crypto" }
+vhdesk-capture = { path = "crates/vhdesk-capture" }
+vhdesk-codec = { path = "crates/vhdesk-codec" }
+vhdesk-input = { path = "crates/vhdesk-input" }
+vhdesk-audio = { path = "crates/vhdesk-audio" }
+vhdesk-transport = { path = "crates/vhdesk-transport" }
+
+anyhow = "1.0.104"
+bytes = "1.12.1"
+postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
+serde = { version = "1.0.229", default-features = false, features = ["derive", "alloc"] }
+thiserror = "2.0.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[profile.release]
+# El pipeline de video es sensible a la latencia: preferimos un binario mas lento de
+# compilar a cambio de que el optimizador vea todo el grafo de llamadas de una vez.
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+debug = true

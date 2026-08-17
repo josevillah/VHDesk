@@ -1,0 +1,11 @@
+[package]
+name = "vhdesk-input"
+description = "Inyeccion de teclado y raton multiplataforma tras un trait comun."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]

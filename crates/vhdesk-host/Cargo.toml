@@ -1,0 +1,16 @@
+[package]
+name = "vhdesk-host"
+description = "Daemon del lado controlado: captura, codifica y envia; recibe input y lo inyecta."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+vhdesk-proto.workspace = true
+
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "vhdesk-transport"
+description = "Transporte QUIC, NAT traversal, relay y control de congestion."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]

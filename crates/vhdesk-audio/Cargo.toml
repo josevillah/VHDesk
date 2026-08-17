@@ -1,0 +1,11 @@
+[package]
+name = "vhdesk-audio"
+description = "Captura y reproduccion de audio con cpal, codec Opus."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]

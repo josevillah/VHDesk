@@ -1,0 +1,4 @@
+# Configuracion por defecto de rustfmt, tal y como manda CLAUDE.md.
+# Este archivo existe unicamente para dejar constancia de que la ausencia de opciones
+# es deliberada y no un olvido: nadie tiene que discutir el estilo.
+edition = "2024"
