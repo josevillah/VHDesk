@@ -10,8 +10,9 @@ use crate::codecs::{AudioCodec, VideoCodec, negotiate};
 use crate::framing::{LENGTH_PREFIX_LEN, MAX_FRAME_LEN, decode, encode};
 use crate::message::{
     AudioFrame, AuthMethod, AuthRequest, AuthResponse, AuthResult, ClipboardFormat,
-    ClipboardUpdate, Cursor, Hello, InputEvent, MAX_ANNOUNCED_CODECS, MAX_PEER_NAME_LEN, Message,
-    MouseButton, PROTOCOL_VERSION, Ping, Pong, Role, VideoFrame,
+    ClipboardUpdate, Cursor, Hello, InputEvent, KeyframeReason, KeyframeRequest,
+    MAX_ANNOUNCED_CODECS, MAX_PEER_NAME_LEN, Message, MouseButton, PROTOCOL_VERSION, Ping, Pong,
+    Role, VideoFrame,
 };
 use crate::{ProtoError, message};
 
@@ -37,6 +38,7 @@ fn one_of_each() -> Vec<Message> {
         Message::VideoFrame(VideoFrame {
             monitor: 1,
             codec: VideoCodec::Vp8,
+            sequence: 1,
             keyframe: true,
             timestamp_us: 123_456_789,
             width: 1920,
@@ -83,6 +85,10 @@ fn one_of_each() -> Vec<Message> {
         Message::ClipboardUpdate(ClipboardUpdate {
             format: ClipboardFormat::Utf8Text,
             data: "hola".as_bytes().to_vec(),
+        }),
+        Message::KeyframeRequest(KeyframeRequest {
+            monitor: 0,
+            reason: KeyframeReason::Gap,
         }),
         Message::Ping(Ping {
             nonce: 0xffff_ffff_ffff_ffff,
@@ -177,6 +183,7 @@ fn el_payload_de_video_no_se_copia_al_decodificar() {
     let original = Message::VideoFrame(VideoFrame {
         monitor: 0,
         codec: VideoCodec::Vp8,
+        sequence: 1,
         keyframe: false,
         timestamp_us: 0,
         width: 64,
@@ -202,6 +209,7 @@ fn el_keyframe_viaja_en_los_flags() {
         let original = Message::VideoFrame(VideoFrame {
             monitor: 0,
             codec: VideoCodec::Av1,
+            sequence: 7,
             keyframe,
             timestamp_us: 0,
             width: 1,
@@ -266,6 +274,7 @@ fn una_cabecera_de_video_truncada_no_entra_en_panico() {
         &Message::VideoFrame(VideoFrame {
             monitor: 0,
             codec: VideoCodec::Vp8,
+            sequence: 1,
             keyframe: true,
             timestamp_us: 0,
             width: 1,
@@ -304,9 +313,10 @@ fn una_cabecera_de_audio_truncada_no_entra_en_panico() {
 
 #[test]
 fn los_bits_reservados_de_video_se_rechazan() {
-    let mut cuerpo = vec![0u8; 15];
+    // Cabecera fija de VideoFrame: monitor(1) codec(1) sequence(8) flags(1) ts(8) w(2) h(2).
+    let mut cuerpo = vec![0u8; 23];
     cuerpo[1] = VideoCodec::Vp8.to_wire();
-    cuerpo[2] = 0b0000_0010; // bit todavia sin asignar
+    cuerpo[10] = 0b0000_0010; // bit todavia sin asignar
 
     let mut buf = raw_frame(0x04, &cuerpo);
     assert_eq!(
@@ -319,7 +329,7 @@ fn los_bits_reservados_de_video_se_rechazan() {
 
 #[test]
 fn un_codec_desconocido_se_rechaza() {
-    let mut cuerpo = vec![0u8; 15];
+    let mut cuerpo = vec![0u8; 23];
     cuerpo[1] = 0x7f; // codec de video sin asignar
 
     let mut buf = raw_frame(0x04, &cuerpo);
@@ -429,6 +439,7 @@ fn codificar_un_frame_demasiado_grande_no_deja_basura_en_el_buffer() {
     let demasiado = Message::VideoFrame(VideoFrame {
         monitor: 0,
         codec: VideoCodec::Vp8,
+        sequence: 1,
         keyframe: true,
         timestamp_us: 0,
         width: 1,

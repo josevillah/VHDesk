@@ -21,10 +21,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use vhdesk_proto::{
-    AudioCodec, Hello, InputEvent, Message, MouseButton, PROTOCOL_VERSION, Ping, Role, VideoCodec,
-    VideoFrame,
+    AudioCodec, Hello, InputEvent, KeyframeReason, KeyframeRequest, Message, MouseButton,
+    PROTOCOL_VERSION, Ping, Role, VideoCodec,
 };
-use vhdesk_transport::{Endpoint, RecepcionVideo, Session, install_crypto_provider};
+use vhdesk_transport::{Endpoint, FrameSaliente, RecepcionVideo, Session, install_crypto_provider};
 
 /// Frames de video que envia el host durante la prueba.
 const FRAMES: u32 = 30;
@@ -176,18 +176,22 @@ async fn hacer_de_viewer(addr: SocketAddr) -> Result<()> {
     }
     println!("datagrama-> {EVENTOS} sondas enviadas");
 
-    // Video: lo recibe el viewer.
+    // Video: lo recibe el viewer, que ademas vigila los huecos de secuencia.
+    let mut receptor = sesion.video_receiver();
     let mut recibidos = 0u32;
     let mut descartados = 0u32;
+    let mut huecos = 0u32;
+    let mut peticiones = 0u32;
     let limite = Instant::now() + Duration::from_secs(15);
 
-    while recibidos + descartados < FRAMES && Instant::now() < limite {
-        match sesion.recv_video_frame().await {
+    while recibidos + descartados + huecos < FRAMES && Instant::now() < limite {
+        match receptor.recv().await {
             Ok(RecepcionVideo::Frame(frame)) => {
                 recibidos += 1;
                 if recibidos == 1 {
                     println!(
-                        "\nvideo    <- primer frame: {}x{}, {} bytes, keyframe={}",
+                        "\nvideo    <- primer frame: seq={}, {}x{}, {} bytes, keyframe={}",
+                        frame.sequence,
                         frame.width,
                         frame.height,
                         frame.data.len(),
@@ -195,12 +199,36 @@ async fn hacer_de_viewer(addr: SocketAddr) -> Result<()> {
                     );
                 }
             }
-            Ok(RecepcionVideo::Descartado) => descartados += 1,
+            Ok(RecepcionVideo::Descartado(_)) => descartados += 1,
+            Ok(RecepcionVideo::Hueco {
+                esperado,
+                recibido,
+                pedir_keyframe,
+            }) => {
+                huecos += 1;
+                if pedir_keyframe {
+                    peticiones += 1;
+                    // Por el canal de control, que es fiable: una peticion perdida dejaria
+                    // la sesion con imagen rota hasta el siguiente hueco.
+                    control
+                        .send(&Message::KeyframeRequest(KeyframeRequest {
+                            monitor: 0,
+                            reason: KeyframeReason::Gap,
+                        }))
+                        .await?;
+                    println!(
+                        "video    <- hueco: esperaba {esperado} y llego {recibido}; keyframe pedido"
+                    );
+                }
+            }
             Err(_) => break,
         }
     }
 
-    println!("video    <- {recibidos} recibidos, {descartados} descartados por el emisor");
+    println!(
+        "video    <- {recibidos} recibidos, {descartados} descartados, {huecos} huecos, \
+         {peticiones} peticiones de keyframe"
+    );
 
     sesion.close();
     endpoint.wait_idle().await;
@@ -238,10 +266,13 @@ async fn recibir_datagramas(sesion: Session) -> u32 {
 }
 
 /// Frame sintetico con el tamano tipico de un inter-frame de 1080p.
-fn frame_de_prueba(indice: u32) -> VideoFrame {
+///
+/// No lleva numero de secuencia: lo pone el transporte, que es el unico que puede
+/// garantizar que sea monotono por sesion.
+fn frame_de_prueba(indice: u32) -> FrameSaliente {
     let relleno: Vec<u8> = (0..10_000u32).map(|b| (b ^ indice) as u8).collect();
 
-    VideoFrame {
+    FrameSaliente {
         monitor: 0,
         codec: VideoCodec::Vp8,
         keyframe: indice == 0,

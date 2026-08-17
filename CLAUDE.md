@@ -293,6 +293,22 @@ Anotados en la fase 0 para que no sorprendan después:
 - **`vpx_codec_set_frame_buffer_functions` es solo de VP9.** Si la Fase 4 mete VP9 o AV1,
   se puede recuperar la opción de suministrar buffers desde fuera y ahorrar la copia del
   frame decodificado. Con VP8 no.
+- **El keyframe ante hueco degenera con congestión sostenida, y hay que arreglarlo aquí.**
+  El mecanismo es: se descartan frames porque el enlace no da → la cadena de referencias se
+  rompe → se responde con un keyframe de ~100 KB → que es justo lo que el enlace no puede
+  tragar → se descartan más frames. Se realimenta. El arreglo de verdad **no** está en el
+  transporte ni en la política de huecos: está en **no codificar más rápido de lo que el
+  enlace admite**, o sea bitrate adaptativo. Que nadie lo redescubra en la Fase 4 mirando
+  las estadísticas de keyframes: la causa está aguas arriba.
+- **Tolerancia a desorden puro (jitter), registrada y no implementada.** Hoy, si el frame
+  N+1 llega antes que el N, se declara hueco y se pide keyframe; si el N venía solo
+  reordenado y llega justo después, se decodifica igual (la política no avanza el último
+  aceptado), pero el keyframe pedido ya era innecesario: ~100 KB y un tirón para nada. En
+  LAN el reordenamiento es raro y no compensa; por internet con retransmisiones no lo es.
+  La opción es **retener un frame fuera de orden durante un intervalo acotado** —del orden
+  de un frame, no más— antes de darlo por hueco. **Hoy no se hace porque es latencia a
+  cambio de ahorrar keyframes**, y sin medir sobre una red real no sabemos cuál de los dos
+  duele más. Decidir con datos, no por intuición.
 
 ## Notas de sesión
 
@@ -532,6 +548,42 @@ autenticación mutua) y en el propio tipo `AcceptAnyServerCert`, que desaparece 
 **Una trampa de la API que costó un test**: `Session` se clona barato pero **la conexión se
 cierra al soltar el último clon**. Mover la única `Session` a una tarea que después termina
 tira la conexión y se pierde lo que quedara en vuelo. Documentado en `Session`.
+
+### 2026-08-17 — Fase 1, bloque C bis: orden entre streams
+
+Un hueco de diseño que habría aparecido en el bloque E como "el vídeo se ve mal a veces".
+**QUIC garantiza el orden dentro de un stream, no entre streams**, y con un stream por
+frame el N+1 puede llegar antes que el N. Es la consecuencia inevitable de haber elegido
+stream-por-frame para evitar el bloqueo de cabecera de línea, no un defecto. Y como el
+emisor descarta frames a propósito, **los huecos son el camino normal de degradación**.
+
+Decodificar un inter-frame sin su referencia no da error: da imagen corrupta en silencio.
+
+- **`VideoFrame` gana `sequence: u64`** y `PROTOCOL_VERSION` sube a **2**. La cabecera fija
+  pasa de 15 a 23 bytes. Lo asigna el transporte, no quien construye el frame.
+- **`FrameSaliente`**: el tipo que entra a `send_frame` **no tiene** campo `sequence`, así
+  que es imposible que el llamante lo ponga. Duplica seis campos y lo vale: ignorar en
+  silencio un campo que alguien rellenó sería una API que miente.
+- **Política del receptor**, en un solo sitio y testeada en puro: viejo → descartar;
+  consecutivo → aceptar; salto con keyframe → aceptar, repara la cadena; salto con
+  inter-frame → hueco, no decodificar. **Sin buffer de reordenación.** Al detectar hueco
+  **no se avanza el último aceptado**, así que un frame solo reordenado que llegue justo
+  después encaja y se acepta.
+- **El emisor no espera a que le pidan el keyframe.** Al abortar un stream sabe que rompió
+  la cadena, así que `keyframe_pendiente()` se pone solo y el host fuerza el keyframe en el
+  frame siguiente. Ahorra un RTT entero de imagen rota, que es el caso más frecuente.
+  `KeyframeRequest` (tag 0x0b) queda como red de seguridad para lo que el emisor **no**
+  puede saber: pérdida real de red, decodificador desincronizado, arranque de sesión.
+- **Amortiguación** en un tipo puro con reloj inyectado: ante varios huecos seguidos solo
+  se pide un keyframe, con reintento a 1 s por si el host la ignora.
+
+**Los streams entrantes se aceptan en paralelo**, una tarea por stream. Leerlos en serie
+reintroduciría el bloqueo de cabecera de línea que stream-por-frame venía a evitar.
+
+**Un test que valía la pena**: el primer intento mandaba 5 frames antes de leer ninguno y
+fallaba. No era un fallo del transporte: la cola del receptor tiene profundidad 4 a
+propósito, y el quinto se tiraba. El test se reescribió para consumir de forma intercalada,
+que es como funciona un viewer real.
 
 **Siguiente paso.** Bloque D: `InputInjector` con `SendInput`.
 

@@ -17,7 +17,12 @@ use crate::codecs::{AudioCodec, VideoCodec};
 /// Version del protocolo que implementa este crate.
 ///
 /// Se incrementa ante cualquier cambio incompatible del formato del wire.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// - **1**: version inicial.
+/// - **2**: `VideoFrame` gana `sequence`, y se anade `KeyframeRequest`. Sin el numero de
+///   secuencia el receptor no puede saber que le falta un frame, y con un stream por frame
+///   los huecos son el camino normal de degradacion, no una excepcion.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Numero maximo de codecs que un peer puede anunciar en su `Hello`.
 ///
@@ -157,6 +162,19 @@ pub struct VideoFrame {
     /// dependa de un estado de sesion que podria estar desincronizado, y para permitir en
     /// el futuro cambiar de codec en caliente sin tocar el formato.
     pub codec: VideoCodec,
+    /// Numero de frame dentro de la sesion, monotono y sin huecos en el emisor.
+    ///
+    /// **Es lo unico que permite al receptor saber que le falta un frame.** QUIC garantiza
+    /// el orden dentro de un stream, pero no entre streams distintos, y aqui cada frame va
+    /// por el suyo: el frame N+1 puede llegar completo antes que el N si el N pierde un
+    /// paquete y hay que retransmitirlo. Ademas el emisor descarta frames a proposito
+    /// cuando se acumulan, asi que los huecos son el camino normal de degradacion.
+    ///
+    /// Decodificar un inter-frame cuya referencia falta no da error: da imagen corrupta.
+    /// Por eso este campo existe.
+    ///
+    /// Lo asigna el transporte, no quien construye el frame.
+    pub sequence: u64,
     /// Si el frame es decodificable por si solo.
     pub keyframe: bool,
     /// Instante de captura, en microsegundos desde el arranque de la sesion.
@@ -300,6 +318,35 @@ pub struct ClipboardUpdate {
     pub data: Vec<u8>,
 }
 
+/// Por que se pide un keyframe.
+///
+/// Se distinguen para que las estadisticas de la fase 4 puedan separar "la red va mal" de
+/// "el decodificador se perdio", que piden soluciones distintas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum KeyframeReason {
+    /// Arranque de sesion: el viewer aun no tiene ninguna imagen.
+    Startup,
+    /// Falta un frame en la secuencia y la cadena de referencias esta rota.
+    Gap,
+    /// El decodificador fallo y no puede seguir con los inter-frames que le lleguen.
+    DecoderError,
+}
+
+/// Peticion de keyframe del viewer al host.
+///
+/// Es la red de seguridad para lo que el emisor **no puede saber**: perdida real de red,
+/// desincronizacion del decodificador y arranque de sesion. Cuando el propio host descarta
+/// un frame, no hace falta pedirselo: el ya sabe que rompio la cadena y fuerza el keyframe
+/// por su cuenta, lo que ahorra un RTT entero de imagen rota.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyframeRequest {
+    /// Monitor cuyo flujo hay que refrescar.
+    pub monitor: u8,
+    /// Motivo, para diagnostico y estadisticas.
+    pub reason: KeyframeReason,
+}
+
 /// Sonda de latencia.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ping {
@@ -338,6 +385,8 @@ pub enum Message {
     Cursor(Cursor),
     /// Ver [`ClipboardUpdate`].
     ClipboardUpdate(ClipboardUpdate),
+    /// Ver [`KeyframeRequest`].
+    KeyframeRequest(KeyframeRequest),
     /// Ver [`Ping`].
     Ping(Ping),
     /// Ver [`Pong`].
@@ -356,6 +405,7 @@ impl Message {
             Self::InputEvent(_) => "InputEvent",
             Self::Cursor(_) => "Cursor",
             Self::ClipboardUpdate(_) => "ClipboardUpdate",
+            Self::KeyframeRequest(_) => "KeyframeRequest",
             Self::Ping(_) => "Ping",
             Self::Pong(_) => "Pong",
         }

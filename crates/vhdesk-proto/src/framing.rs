@@ -48,6 +48,7 @@ const TAG_CURSOR: u8 = 0x07;
 const TAG_CLIPBOARD_UPDATE: u8 = 0x08;
 const TAG_PING: u8 = 0x09;
 const TAG_PONG: u8 = 0x0a;
+const TAG_KEYFRAME_REQUEST: u8 = 0x0b;
 
 /// Bit de `flags` de [`VideoFrame`] que marca un keyframe.
 const VIDEO_FLAG_KEYFRAME: u8 = 0b0000_0001;
@@ -65,6 +66,7 @@ const fn tag_of(message: &Message) -> u8 {
         Message::InputEvent(_) => TAG_INPUT_EVENT,
         Message::Cursor(_) => TAG_CURSOR,
         Message::ClipboardUpdate(_) => TAG_CLIPBOARD_UPDATE,
+        Message::KeyframeRequest(_) => TAG_KEYFRAME_REQUEST,
         Message::Ping(_) => TAG_PING,
         Message::Pong(_) => TAG_PONG,
     }
@@ -106,6 +108,7 @@ fn encode_inner(message: &Message, out: &mut BytesMut) -> Result<(), ProtoError>
         Message::InputEvent(event) => encode_control(event, out)?,
         Message::Cursor(cursor) => encode_control(cursor, out)?,
         Message::ClipboardUpdate(update) => encode_control(update, out)?,
+        Message::KeyframeRequest(request) => encode_control(request, out)?,
         Message::Ping(ping) => encode_control(ping, out)?,
         Message::Pong(pong) => encode_control(pong, out)?,
         Message::VideoFrame(frame) => encode_video_frame(frame, out),
@@ -139,6 +142,7 @@ fn encode_control<T: serde::Serialize>(value: &T, out: &mut BytesMut) -> Result<
 fn encode_video_frame(frame: &VideoFrame, out: &mut BytesMut) {
     out.put_u8(frame.monitor);
     out.put_u8(frame.codec.to_wire());
+    out.put_u64_le(frame.sequence);
     out.put_u8(if frame.keyframe {
         VIDEO_FLAG_KEYFRAME
     } else {
@@ -213,6 +217,7 @@ fn decode_body(body: &Bytes) -> Result<Message, ProtoError> {
         TAG_INPUT_EVENT => decode_control(&rest).map(Message::InputEvent),
         TAG_CURSOR => decode_control(&rest).map(Message::Cursor),
         TAG_CLIPBOARD_UPDATE => decode_control(&rest).map(Message::ClipboardUpdate),
+        TAG_KEYFRAME_REQUEST => decode_control(&rest).map(Message::KeyframeRequest),
         TAG_PING => decode_control(&rest).map(Message::Ping),
         TAG_PONG => decode_control(&rest).map(Message::Pong),
         other => Err(ProtoError::UnknownTag { tag: other }),
@@ -239,6 +244,7 @@ fn decode_video_frame(body: Bytes) -> Result<VideoFrame, ProtoError> {
 
     let monitor = reader.u8()?;
     let codec = VideoCodec::from_wire(reader.u8()?)?;
+    let sequence = reader.u64()?;
     let flags = reader.u8()?;
     if flags & VIDEO_FLAGS_RESERVED != 0 {
         return Err(ProtoError::ReservedBitsSet {
@@ -252,6 +258,7 @@ fn decode_video_frame(body: Bytes) -> Result<VideoFrame, ProtoError> {
     Ok(VideoFrame {
         monitor,
         codec,
+        sequence,
         keyframe: flags & VIDEO_FLAG_KEYFRAME != 0,
         timestamp_us,
         width,

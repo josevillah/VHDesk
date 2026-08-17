@@ -6,8 +6,9 @@ use bytes::BytesMut;
 use quinn::Connection;
 use vhdesk_proto::Message;
 
-use crate::channels::{ControlChannel, InputReceiver, InputSender, RecepcionVideo, VideoSender};
+use crate::channels::{ControlChannel, InputReceiver, InputSender};
 use crate::error::TransportError;
+use crate::video::{VideoReceiver, VideoSender};
 
 /// Conexion viva con un peer, con sus cuatro canales.
 ///
@@ -24,8 +25,14 @@ use crate::error::TransportError;
 /// todos son video.
 ///
 /// Es una invariante del diseno, no una casualidad, y se apoya en ella para no gastar un
-/// byte de etiqueta por stream. Si alguna vez hiciera falta que el host mande algo mas por
-/// un unidireccional propio, habria que introducir esa etiqueta antes.
+/// byte de etiqueta por stream.
+///
+/// **Se rompe en los dos sentidos**, y hay un caso concreto ya previsto: la transferencia
+/// de archivos de la fase 5 va del viewer al host, asi que necesitara su propio canal
+/// unidireccional en esa direccion y el host dejara de poder asumir que todo lo que acepta
+/// es input. Lo mismo pasaria si el host necesitara un unidireccional propio ademas del
+/// video. En cuanto ocurra cualquiera de los dos hay que introducir una etiqueta de canal
+/// al principio de cada stream, antes de anadir el canal nuevo, no despues.
 ///
 /// # Cuidado al repartirla entre tareas
 ///
@@ -94,13 +101,13 @@ impl Session {
         VideoSender::new(self.conn.clone())
     }
 
-    /// Espera al siguiente frame de video.
+    /// Crea el receptor de video de esta sesion.
     ///
-    /// # Errores
-    ///
-    /// Ver [`crate::channels::recibir_frame`].
-    pub async fn recv_video_frame(&self) -> Result<RecepcionVideo, TransportError> {
-        crate::channels::recibir_frame(&self.conn).await
+    /// **Uno por sesion.** Lleva la cuenta de la secuencia y arranca la tarea que acepta
+    /// los streams entrantes; con dos, cada uno veria la mitad de los frames y ambos
+    /// creerian que faltan huecos por todas partes.
+    pub fn video_receiver(&self) -> VideoReceiver {
+        VideoReceiver::new(self.conn.clone())
     }
 
     /// Envia un mensaje por datagrama.

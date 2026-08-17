@@ -21,6 +21,9 @@
 //! frame, con `RESET_STREAM` para el que quede obsoleto. La misma regla alcanza a la forma
 //! del cursor, que tampoco cabe y va por el canal de control.
 //!
+//! Como consecuencia de eso ultimo, **el orden entre frames no esta garantizado** y hace
+//! falta numero de secuencia. Ver [`video`], que explica la politica entera.
+//!
 //! # Ejemplo
 //!
 //! ```no_run
@@ -47,11 +50,14 @@ pub mod endpoint;
 pub mod error;
 pub mod session;
 pub mod tls;
+pub mod video;
 
-pub use crate::channels::{
-    ControlChannel, InputReceiver, InputSender, RecepcionVideo, VideoSender,
-};
+pub use crate::channels::{ControlChannel, InputReceiver, InputSender};
 pub use crate::endpoint::Endpoint;
 pub use crate::error::TransportError;
 pub use crate::session::Session;
 pub use crate::tls::{ALPN, install_crypto_provider};
+pub use crate::video::{
+    AmortiguadorKeyframe, Decision, FrameSaliente, MotivoDescarte, PoliticaOrden, RecepcionVideo,
+    VideoReceiver, VideoSender,
+};

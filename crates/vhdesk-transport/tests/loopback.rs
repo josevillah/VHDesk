@@ -10,10 +10,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use vhdesk_proto::{
     AudioCodec, Cursor, Hello, InputEvent, Message, MouseButton, PROTOCOL_VERSION, Ping, Role,
-    VideoCodec, VideoFrame,
+    VideoCodec,
 };
 use vhdesk_transport::{
-    Endpoint, RecepcionVideo, Session, TransportError, install_crypto_provider,
+    Endpoint, FrameSaliente, RecepcionVideo, Session, TransportError, install_crypto_provider,
 };
 
 /// Levanta las dos puntas de una sesion por loopback.
@@ -113,31 +113,43 @@ async fn el_input_llega_por_su_stream_y_en_orden() {
     assert_eq!(recibidos, eventos, "el stream fiable conserva el orden");
 }
 
+fn frame(indice: u32, keyframe: bool, bytes: usize) -> FrameSaliente {
+    FrameSaliente {
+        monitor: 0,
+        codec: VideoCodec::Vp8,
+        keyframe,
+        timestamp_us: u64::from(indice) * 33_333,
+        width: 1920,
+        height: 1080,
+        data: Bytes::from(vec![indice as u8; bytes]),
+    }
+}
+
 #[tokio::test]
 async fn un_frame_de_video_llega_entero_por_su_propio_stream() {
     let (_he, host, _ve, viewer) = sesion().await;
+    let mut receptor = viewer.video_receiver();
 
     let datos: Vec<u8> = (0..20_000u32).map(|b| b as u8).collect();
-    let frame = VideoFrame {
-        monitor: 0,
-        codec: VideoCodec::Vp8,
-        keyframe: true,
-        timestamp_us: 12_345,
-        width: 1920,
-        height: 1080,
-        data: Bytes::from(datos.clone()),
-    };
-
     let mut emisor = host.video_sender();
-    emisor.send_frame(frame.clone()).expect("encolar frame");
+    emisor
+        .send_frame(FrameSaliente {
+            monitor: 0,
+            codec: VideoCodec::Vp8,
+            keyframe: true,
+            timestamp_us: 12_345,
+            width: 1920,
+            height: 1080,
+            data: Bytes::from(datos.clone()),
+        })
+        .expect("encolar frame");
 
-    let recibido = viewer.recv_video_frame().await.expect("recibir video");
-    let RecepcionVideo::Frame(recibido) = recibido else {
+    let RecepcionVideo::Frame(recibido) = receptor.recv().await.expect("recibir video") else {
         panic!("el frame se descarto cuando no deberia");
     };
 
-    assert_eq!(recibido.width, 1920);
-    assert_eq!(recibido.height, 1080);
+    assert_eq!(recibido.sequence, 0, "el transporte numera desde cero");
+    assert_eq!((recibido.width, recibido.height), (1920, 1080));
     assert!(recibido.keyframe);
     assert_eq!(recibido.timestamp_us, 12_345);
     assert_eq!(recibido.data.as_ref(), datos.as_slice());
@@ -146,37 +158,114 @@ async fn un_frame_de_video_llega_entero_por_su_propio_stream() {
 #[tokio::test]
 async fn varios_frames_seguidos_llegan_todos_cuando_hay_sitio() {
     let (_he, host, _ve, viewer) = sesion().await;
+    let mut receptor = viewer.video_receiver();
 
     let mut emisor = host.video_sender();
-    for indice in 0..5u32 {
-        emisor
-            .send_frame(VideoFrame {
-                monitor: 0,
-                codec: VideoCodec::Vp8,
-                keyframe: indice == 0,
-                timestamp_us: u64::from(indice),
-                width: 320,
-                height: 240,
-                data: Bytes::from(vec![indice as u8; 1024]),
-            })
-            .expect("encolar");
-        // Se deja salir cada frame antes de encolar el siguiente: sin esto el emisor
-        // descartaria los anteriores, que es su comportamiento correcto pero no lo que
-        // este test comprueba.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
     let mut recibidos = 0;
-    for _ in 0..5 {
-        match tokio::time::timeout(Duration::from_secs(5), viewer.recv_video_frame()).await {
-            Ok(Ok(RecepcionVideo::Frame(_))) => recibidos += 1,
-            Ok(Ok(RecepcionVideo::Descartado)) => {}
-            _ => break,
+
+    // Se envia y se consume de forma intercalada, que es como funciona un viewer real. Si
+    // se enviaran los cinco antes de leer ninguno, la cola del receptor (profundidad 4) se
+    // llenaria y el ultimo se tiraria: comportamiento correcto, pero no lo que se mide
+    // aqui.
+    for esperado in 0..5u64 {
+        emisor
+            .send_frame(frame(esperado as u32, esperado == 0, 1024))
+            .expect("encolar");
+
+        match tokio::time::timeout(Duration::from_secs(5), receptor.recv()).await {
+            Ok(Ok(RecepcionVideo::Frame(f))) => {
+                assert_eq!(f.sequence, esperado, "la secuencia debe ser consecutiva");
+                recibidos += 1;
+            }
+            otro => panic!("no llego el frame {esperado}: {otro:?}"),
         }
     }
 
     assert_eq!(recibidos, 5, "se perdieron frames sin haber congestion");
     assert_eq!(emisor.descartados(), 0);
+    assert!(
+        !emisor.keyframe_pendiente(),
+        "sin descartes no deberia quedar keyframe pendiente"
+    );
+}
+
+#[tokio::test]
+async fn el_emisor_marca_keyframe_pendiente_al_descartar() {
+    let (_he, host, _ve, _viewer) = sesion().await;
+    let mut emisor = host.video_sender();
+
+    // El primer frame ya viene con keyframe pendiente: sin el, el viewer no engancha.
+    assert!(emisor.keyframe_pendiente());
+    emisor.send_frame(frame(0, true, 1024)).expect("keyframe");
+    assert!(!emisor.keyframe_pendiente());
+
+    // Frames grandes en bucle apretado, sin dejar que salga ninguno: el emisor tiene que
+    // ir abortando los anteriores.
+    for indice in 1..40u32 {
+        emisor
+            .send_frame(frame(indice, false, 512 * 1024))
+            .expect("encolar");
+    }
+
+    assert!(
+        emisor.descartados() > 0,
+        "el bucle apretado deberia haber forzado descartes"
+    );
+    assert!(
+        emisor.keyframe_pendiente(),
+        "tras descartar, el emisor sabe que rompio la cadena y debe forzar keyframe sin \
+         esperar a que se lo pidan"
+    );
+}
+
+#[tokio::test]
+async fn un_hueco_se_detecta_y_pide_keyframe_una_sola_vez() {
+    let (_he, host, _ve, viewer) = sesion().await;
+    let mut receptor = viewer.video_receiver();
+    let mut emisor = host.video_sender();
+
+    // Keyframe inicial, que el receptor acepta y fija como referencia.
+    emisor.send_frame(frame(0, true, 1024)).expect("keyframe");
+    let RecepcionVideo::Frame(primero) = receptor.recv().await.expect("recibir") else {
+        panic!("el keyframe inicial deberia aceptarse");
+    };
+    assert_eq!(primero.sequence, 0);
+
+    // Frames grandes en bucle apretado para que el emisor descarte y aparezcan huecos.
+    for indice in 1..40u32 {
+        emisor
+            .send_frame(frame(indice, false, 512 * 1024))
+            .expect("encolar");
+    }
+    assert!(emisor.descartados() > 0, "hacian falta descartes");
+
+    let mut huecos = 0;
+    let mut peticiones = 0;
+
+    // Se recogen unos cuantos resultados; los que lleguen seran una mezcla de descartes
+    // del emisor y huecos, y lo que se comprueba es la amortiguacion.
+    for _ in 0..10 {
+        match tokio::time::timeout(Duration::from_secs(2), receptor.recv()).await {
+            Ok(Ok(RecepcionVideo::Hueco { pedir_keyframe, .. })) => {
+                huecos += 1;
+                if pedir_keyframe {
+                    peticiones += 1;
+                }
+            }
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+
+    assert!(
+        huecos > 0,
+        "el receptor deberia haber detectado algun hueco"
+    );
+    assert_eq!(
+        peticiones, 1,
+        "con {huecos} huecos seguidos solo debe pedirse un keyframe: sin amortiguacion, \
+         una red mala genera una tormenta de keyframes de ~100 KB"
+    );
 }
 
 #[tokio::test]
