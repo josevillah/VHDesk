@@ -37,6 +37,23 @@ con el que usa Rust en MSVC. `x64-windows-static-md` es la combinación correcta
 Si prefieres una instalación global de vcpkg en lugar del manifiesto, define `VCPKG_ROOT` y
 el `build.rs` también la encontrará.
 
+### LLVM instalado con winget no deja `libclang` a la vista
+
+`winget install LLVM.LLVM` **no añade LLVM al `PATH`**, así que bindgen no la encuentra y
+el `build.rs` falla al generar los enlaces de libvpx. No hace falta arreglar el `PATH`: lo
+que bindgen carga es `libclang.dll`, no el ejecutable `clang.exe`, y para eso basta con
+señalar el directorio que la contiene.
+
+```powershell
+$env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
+```
+
+Para que la variable sobreviva a la sesión de terminal:
+
+```powershell
+[Environment]::SetEnvironmentVariable('LIBCLANG_PATH', 'C:\Program Files\LLVM\bin', 'User')
+```
+
 ## Linux
 
 ```bash

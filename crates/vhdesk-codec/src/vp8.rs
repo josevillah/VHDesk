@@ -12,6 +12,8 @@
 //!   medio.
 //! - `rc_end_usage = VPX_CBR` con buffers de rate control cortos: preferimos un bitrate
 //!   estable a picos que llenen la cola de la red.
+//! - `kf_mode = VPX_KF_DISABLED`: los keyframes los pide la aplicacion, uno por uno. Ver
+//!   la seccion de keyframes bajo demanda en la documentacion del crate.
 //!
 //! # Seguridad de memoria
 //!
@@ -120,8 +122,11 @@ impl Vp8Encoder {
         cfg.g_pass = vpx::vpx_enc_pass::VPX_RC_ONE_PASS;
         cfg.g_lag_in_frames = 0;
         cfg.g_error_resilient = vpx::VPX_ERROR_RESILIENT_DEFAULT;
-        cfg.kf_mode = vpx::vpx_kf_mode::VPX_KF_AUTO;
-        cfg.kf_max_dist = config.keyframe_interval_secs.max(1) * fps;
+        // Keyframes SOLO bajo demanda. `VPX_KF_DISABLED` no es un detalle de ajuste: con
+        // `VPX_KF_AUTO`, libvpx inserta keyframes por su cuenta al detectar cambio de
+        // escena, y en un escritorio eso ocurre cada vez que el usuario cambia de ventana.
+        // Con el modo automatico, "bajo demanda" no significaria nada.
+        cfg.kf_mode = vpx::vpx_kf_mode::VPX_KF_DISABLED;
         cfg.g_threads = 1;
 
         // Buffers de rate control cortos, en milisegundos. Los valores por defecto estan

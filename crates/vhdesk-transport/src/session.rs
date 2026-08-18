@@ -158,6 +158,16 @@ impl Session {
         self.conn.max_datagram_size()
     }
 
+    /// Espera a que la conexion se cierre, por la razon que sea.
+    ///
+    /// Es lo que permite a quien orquesta la sesion enterarse de que termino sin tener que
+    /// vigilar cada canal por separado. Incluye el cierre por inactividad, que con la
+    /// pantalla quieta seria el final normal si no fuera por el keepalive; ver
+    /// [`crate::KEEPALIVE`].
+    pub async fn cerrada(&self) -> TransportError {
+        TransportError::Connection(self.conn.closed().await)
+    }
+
     /// Cierra la sesion avisando al peer.
     pub fn close(&self) {
         self.conn.close(0u32.into(), b"fin de sesion");

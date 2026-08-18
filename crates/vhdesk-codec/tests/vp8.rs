@@ -41,10 +41,41 @@ fn escena(paso: u32) -> Vec<u8> {
     datos
 }
 
+/// Escena completamente distinta de la anterior, para provocar un cambio de plano.
+///
+/// Un degradado diagonal no comparte nada con el rectangulo de [`escena`]: es lo que una
+/// heuristica de deteccion de cambio de escena tiene que ver como corte.
+fn escena_alterna(paso: u32) -> Vec<u8> {
+    let mut datos = vec![0u8; (ANCHO * ALTO * 4) as usize];
+    let fase = (paso % 64) as u8;
+
+    for y in 0..ALTO {
+        for x in 0..ANCHO {
+            let p = ((y * ANCHO + x) * 4) as usize;
+            let diagonal = ((x + y) % 256) as u8;
+
+            datos[p] = diagonal.wrapping_add(fase);
+            datos[p + 1] = diagonal.wrapping_mul(3);
+            datos[p + 2] = 255u8.wrapping_sub(diagonal);
+            datos[p + 3] = 255;
+        }
+    }
+
+    datos
+}
+
 fn frame_i420(paso: u32) -> I420Frame {
+    i420_desde(&escena(paso))
+}
+
+fn frame_i420_alterno(paso: u32) -> I420Frame {
+    i420_desde(&escena_alterna(paso))
+}
+
+fn i420_desde(bgra: &[u8]) -> I420Frame {
     let mut frame = I420Frame::new(ANCHO, ALTO).expect("crear I420");
     frame
-        .fill_from_bgra(&escena(paso), (ANCHO * 4) as usize)
+        .fill_from_bgra(bgra, (ANCHO * 4) as usize)
         .expect("convertir a I420");
     frame
 }
@@ -150,7 +181,80 @@ fn una_secuencia_se_decodifica_entera_y_los_intermedios_no_son_keyframes() {
     assert_eq!(decodificados, 30, "se perdieron frames por el camino");
     assert_eq!(
         keyframes, 1,
-        "con intervalo de 4 s a 60 fps solo el primero de 30 frames deberia ser keyframe"
+        "sin keyframes periodicos, de 30 frames solo el primero deberia serlo"
+    );
+}
+
+/// Fija por escrito la decision de keyframes bajo demanda.
+///
+/// Son 300 frames, mas que los 240 que habria durado el intervalo periodico que se retiro
+/// (4 s a 60 fps), y con cambios de escena bruscos cada 30 frames. Si alguien devuelve
+/// `kf_mode` a `VPX_KF_AUTO`, este test falla por las dos razones a la vez: libvpx volveria
+/// a insertar keyframes periodicos **y** por deteccion de cambio de escena, que en un
+/// escritorio se dispara cada vez que el usuario cambia de ventana.
+#[test]
+fn no_hay_keyframes_periodicos_ni_por_cambio_de_escena() {
+    let mut encoder = codificador();
+
+    let mut keyframes = 0;
+    for paso in 0..300u32 {
+        // Cada 30 frames la pantalla entera cambia de contenido, que es justo lo que la
+        // heuristica de cambio de escena de libvpx busca.
+        let frame = if (paso / 30) % 2 == 0 {
+            frame_i420(paso)
+        } else {
+            frame_i420_alterno(paso)
+        };
+
+        let Some(comprimido) = encoder
+            .encode(&frame, u64::from(paso) * 16_666)
+            .expect("codificar")
+        else {
+            continue;
+        };
+        if comprimido.keyframe {
+            keyframes += 1;
+        }
+    }
+
+    assert_eq!(
+        keyframes, 1,
+        "salieron {keyframes} keyframes en 300 frames; solo debe salir el de arranque, \
+         porque nadie mas los pidio"
+    );
+}
+
+/// Pantalla quieta mas peticion explicita: el keyframe tiene que salir.
+///
+/// Es el escenario de un viewer que se reengancha a una maquina inactiva, y es el caso mas
+/// probable de todos. Si el host cortocircuitara por "no hay nada que codificar" antes de
+/// mirar si hay un keyframe pedido, el viewer se quedaria esperando una imagen que no llega
+/// nunca. Aqui se fija la mitad que le toca al codec: **el mismo frame, sin un solo pixel
+/// distinto, tiene que producir keyframe cuando se pide**.
+#[test]
+fn con_la_pantalla_quieta_una_peticion_sigue_produciendo_keyframe() {
+    let mut encoder = codificador();
+    let quieto = frame_i420(0);
+
+    encoder.encode(&quieto, 0).expect("primer frame");
+
+    // Unos cuantos frames identicos: el codificador los comprime a casi nada.
+    for paso in 1..10u32 {
+        encoder
+            .encode(&quieto, u64::from(paso) * 16_666)
+            .expect("frame quieto");
+    }
+
+    encoder.request_keyframe();
+    let salida = encoder
+        .encode(&quieto, 10 * 16_666)
+        .expect("codificar tras la peticion")
+        .expect("una peticion de keyframe siempre produce salida, aunque nada haya cambiado");
+
+    assert!(
+        salida.keyframe,
+        "con la pantalla quieta la peticion de keyframe se perdio: un viewer que se \
+         reenganche a una maquina inactiva se quedaria con la pantalla en blanco"
     );
 }
 

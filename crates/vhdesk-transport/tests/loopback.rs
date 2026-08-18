@@ -52,6 +52,59 @@ fn saludo() -> Message {
     })
 }
 
+/// Una sesion sin nada de trafico **no se cae sola**.
+///
+/// Es el fallo mas espectacular y mas trivial de reproducir que puede tener este proyecto:
+/// los keyframes son bajo demanda y una pantalla inmovil no genera frames, asi que un
+/// usuario que se levante a por un cafe deja de producir trafico de video por completo. Con
+/// los valores por defecto de quinn (`max_idle_timeout` de 30 s y `keep_alive_interval` en
+/// `None`), la conexion moria en medio minuto y volver al teclado encontraba la sesion
+/// cerrada.
+///
+/// El test tarda mas que el timeout a proposito: comprobar la configuracion en vez del
+/// comportamiento no demostraria nada, porque el timeout efectivo es el minimo de lo que
+/// anuncian los dos peers y basta con olvidarse de un lado para romperlo.
+#[tokio::test]
+async fn una_sesion_ociosa_sobrevive_al_timeout_de_inactividad() {
+    let (_he, host, _ve, viewer) = sesion().await;
+
+    // El canal se abre antes del silencio para que lo que se mida despues sea la conexion y
+    // no el establecimiento del stream.
+    let aceptar = tokio::spawn({
+        let host = host.clone();
+        async move { host.accept_control().await.expect("aceptar control") }
+    });
+    let mut control_viewer = viewer.open_control().await.expect("abrir control");
+    control_viewer
+        .send(&saludo())
+        .await
+        .expect("saludo inicial");
+    let mut control_host = aceptar.await.expect("tarea");
+    control_host.recv().await.expect("saludo inicial");
+
+    // Silencio absoluto durante mas de lo que dura el timeout. Lo unico que puede circular
+    // por aqui es el PING de keepalive de QUIC.
+    let silencio = vhdesk_transport::IDLE_TIMEOUT + Duration::from_secs(3);
+    tokio::time::sleep(silencio).await;
+
+    // Y despues del silencio la conexion tiene que seguir sirviendo.
+    control_viewer
+        .send(&saludo())
+        .await
+        .expect("la conexion murio durante el silencio");
+
+    let recibido = tokio::time::timeout(Duration::from_secs(5), control_host.recv())
+        .await
+        .expect("no llego nada tras el silencio")
+        .expect("la conexion murio durante el silencio");
+
+    assert_eq!(
+        recibido.name(),
+        "Hello",
+        "tras {silencio:?} de inactividad la sesion tiene que seguir en pie"
+    );
+}
+
 #[tokio::test]
 async fn el_canal_de_control_hace_ida_y_vuelta() {
     let (_he, host, _ve, viewer) = sesion().await;
@@ -164,9 +217,9 @@ async fn varios_frames_seguidos_llegan_todos_cuando_hay_sitio() {
     let mut recibidos = 0;
 
     // Se envia y se consume de forma intercalada, que es como funciona un viewer real. Si
-    // se enviaran los cinco antes de leer ninguno, la cola del receptor (profundidad 4) se
-    // llenaria y el ultimo se tiraria: comportamiento correcto, pero no lo que se mide
-    // aqui.
+    // se enviaran los cinco antes de leer ninguno, la ranura del receptor desalojaria los
+    // atrasados y solo sobreviviria el ultimo: comportamiento correcto y deliberado, pero
+    // no lo que se mide aqui. Eso lo cubre `la_ranura_llena_desaloja_el_frame_viejo`.
     for esperado in 0..5u64 {
         emisor
             .send_frame(frame(esperado as u32, esperado == 0, 1024))
@@ -187,6 +240,56 @@ async fn varios_frames_seguidos_llegan_todos_cuando_hay_sitio() {
         !emisor.keyframe_pendiente(),
         "sin descartes no deberia quedar keyframe pendiente"
     );
+}
+
+/// Con la ranura llena sobrevive el frame **nuevo**, no el viejo.
+///
+/// Es el cambio de comportamiento del bloque E y merece quedar fijado contra la red real,
+/// no solo en la funcion pura. Antes la cola descartaba lo que acababa de llegar y dejaba al
+/// consumidor arrastrando imagen atrasada; ahora es al reves, que es lo que exige el
+/// criterio de latencia: un frame retrasado ya no vale nada cuando se entrega.
+#[tokio::test]
+async fn la_ranura_llena_desaloja_el_frame_viejo() {
+    let (_he, host, _ve, viewer) = sesion().await;
+    let mut receptor = viewer.video_receiver();
+    let mut emisor = host.video_sender();
+
+    emisor.send_frame(frame(0, true, 1024)).expect("keyframe");
+    match tokio::time::timeout(Duration::from_secs(5), receptor.recv()).await {
+        Ok(Ok(RecepcionVideo::Frame(f))) => assert_eq!(f.sequence, 0),
+        otro => panic!("no llego el keyframe inicial: {otro:?}"),
+    }
+
+    // Tres frames que llegan enteros mientras nadie los recoge. La pausa es para que cada
+    // stream termine y el emisor no aborte el anterior: lo que se quiere observar es el
+    // desalojo en el **receptor**, no el descarte en el emisor.
+    for secuencia in 1..=3u32 {
+        emisor
+            .send_frame(frame(secuencia, false, 1024))
+            .expect("encolar");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        emisor.descartados(),
+        0,
+        "el emisor no deberia haber abortado nada: la pausa le da tiempo de sobra"
+    );
+
+    // El unico que queda es el ultimo. Como es inter-frame y se saltaron dos, la politica
+    // lo declara hueco, que es exactamente la senal que queremos: mejor un keyframe que
+    // pintar imagen vieja.
+    match tokio::time::timeout(Duration::from_secs(5), receptor.recv()).await {
+        Ok(Ok(RecepcionVideo::Hueco {
+            esperado, recibido, ..
+        })) => {
+            assert_eq!(esperado, 1);
+            assert_eq!(
+                recibido, 3,
+                "sobrevivio el frame equivocado: la ranura desalojo el nuevo en vez del viejo"
+            );
+        }
+        otro => panic!("se esperaba un hueco con el frame mas reciente: {otro:?}"),
+    }
 }
 
 #[tokio::test]

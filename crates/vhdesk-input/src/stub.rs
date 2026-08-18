@@ -7,7 +7,7 @@
 use crate::InputInjector;
 use crate::error::InputError;
 
-pub fn open_injector() -> Result<Box<dyn InputInjector>, InputError> {
+pub fn open_injector() -> Result<Box<dyn InputInjector + Send>, InputError> {
     // FASE 1b: `uinput` en Linux, que funciona igual en X11 y en Wayland y necesita una
     // regla udev o pertenencia al grupo `input`, con el dispositivo declarado con
     // `ABS_X`/`ABS_Y` para que el posicionamiento absoluto sea fiable. `CGEvent` en macOS,

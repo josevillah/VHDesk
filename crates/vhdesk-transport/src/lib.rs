@@ -52,12 +52,14 @@ pub mod session;
 pub mod tls;
 pub mod video;
 
-pub use crate::channels::{ControlChannel, InputReceiver, InputSender};
+pub use crate::channels::{
+    ControlChannel, ControlReceiver, ControlSender, InputReceiver, InputSender,
+};
 pub use crate::endpoint::Endpoint;
 pub use crate::error::TransportError;
 pub use crate::session::Session;
-pub use crate::tls::{ALPN, install_crypto_provider};
+pub use crate::tls::{ALPN, IDLE_TIMEOUT, KEEPALIVE, install_crypto_provider};
 pub use crate::video::{
     AmortiguadorKeyframe, Decision, FrameSaliente, MotivoDescarte, PoliticaOrden, RecepcionVideo,
-    VideoReceiver, VideoSender,
+    SenalKeyframe, VideoReceiver, VideoSender,
 };

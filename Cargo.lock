@@ -1360,9 +1360,16 @@ name = "vhdesk-host"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "bytes",
+ "png",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "vhdesk-capture",
+ "vhdesk-codec",
+ "vhdesk-input",
  "vhdesk-proto",
+ "vhdesk-transport",
 ]
 
 [[package]]

@@ -49,6 +49,24 @@ arquitectura como referencia conceptual está bien; copiar código no.
    esa dirección, recházala y dímelo.
 9. Todo `unsafe` lleva comentario `// SAFETY:` explicando por qué es correcto.
 
+### Deuda de seguridad abierta que la Fase 2 tiene que cerrar
+
+Esto no es una simplificación cómoda que ya funciona: es un agujero con forma de bypass de
+autenticación, escrito aquí para que quien haga la Fase 2 lo lea como trabajo pendiente y no
+como código que ya está bien.
+
+- **El host emite hoy `AuthResponse::Accepted` sin ningún `AuthRequest` previo.** Lo hace en
+  `vhdesk-host/src/sesion.rs`, en el handshake, porque ahí es donde el protocolo coloca el
+  códec elegido y en la Fase 1 no hay autenticación. **Requisito de la Fase 2: el host no
+  debe emitir `AuthResult::Accepted` sin un `AuthRequest` válido previo y sin el
+  consentimiento en pantalla de su dueño.**
+- **Y hay que cerrarlo también por el lado del receptor**: la máquina de estados del viewer
+  debe **rechazar** un `Accepted` que no haya solicitado, en vez de creérselo. Cerrar solo el
+  emisor deja al viewer aceptando sesiones de cualquier host que le mande un `Accepted`
+  espontáneo.
+- Relacionado y ya anotado en el código: `AcceptAnyServerCert` y la ausencia de verificador
+  de certificado de cliente en `vhdesk-transport/src/tls.rs`.
+
 ## Arquitectura
 
 ```
@@ -170,6 +188,24 @@ De ahí, tres reglas que el bloque E no puede romper:
    en pantalla.
 3. **Se mide la latencia extremo a extremo, no los FPS.** Los FPS son un indicador
    secundario que puede mejorar mientras la experiencia empeora.
+
+### Pendiente de medir en el bloque F: capacidad de la ranura de recepción, 1 contra 2
+
+`CAPACIDAD_RANURA` en `vhdesk-transport/src/video.rs` vale **1**, y el razonamiento está
+junto a la constante. Resumido: la cifra arbitra entre dos cosas que es fácil confundir.
+
+- **Retraso del consumidor**: cada hueco de cola es un frame entero de latencia añadida (33
+  ms a 30 fps) que además ya no vale nada cuando se entrega. Por este lado la capacidad
+  correcta es 1.
+- **Jitter entre streams paralelos**: los frames se leen en tareas concurrentes, así que dos
+  pueden terminar casi a la vez aunque se emitieran separados. Con capacidad 1 ese
+  solapamiento sub-frame produce un hueco, y un hueco cuesta un keyframe de ~100 KB.
+
+Se empieza en 1 porque el consumidor no es el hilo de pintado sino el de decodificación, que
+drena en un par de milisegundos. **Medir 1 contra 2 con latencia extremo a extremo y
+keyframes por segundo**, no discutirlo: subirlo es cambiar ese número y nada más. La primera
+medición ya da un dato: 4 huecos en 590 frames por loopback, con el sumidero volcando PNG a
+disco entre frame y frame, o sea con el consumidor artificialmente lento.
 
 ### Pendiente de evaluar en el bloque E: doble textura de staging
 
@@ -637,7 +673,79 @@ teclado la pone el host (ver riesgos).
 Hz solo cuenta la última posición, y no tiene sentido mandar más de uno por frame. Los
 botones no se fusionan nunca.
 
-**Siguiente paso.** Bloque E: juntar host y viewer.
+### 2026-08-18 — Fase 1, bloque E1: el host completo
+
+**Máquina nueva.** El desarrollo pasa a un PC de escritorio (JOSE-VILLA, **NVIDIA RTX
+5060 dedicada**, 1920x1080 al 100%). Es justo la máquina con GPU dedicada que faltaba para
+poder juzgar las cifras de staging; ver la advertencia de la sección de métricas, que sigue
+en pie porque el staging todavía no se ha vuelto a medir aquí por separado.
+
+**El host completo, verificado contra un sumidero que decodifica de verdad**
+(`vhdesk-host --example sumidero`): handshake, negociación de códec, vídeo, cursor por sus
+dos caminos e inyección de entrada. Por loopback a 1080p: **247 frames en 10 s (24,7 fps con
+la cota en 30), 8,03 Mbps, 0 descartes del emisor, 0 huecos**, keyframe medio 93 KB e inter
+39 KB.
+
+**Pipeline en dos hilos, no en cuatro.** Captura por un lado; conversión y encode juntas por
+otro. Separar la captura es lo que compra algo real: paga 3,14 ms de media y 9,18 de p99
+bloqueada esperando a la GPU, y ese bloqueo no debe frenar al encoder. Separar conversión
+(1,32 ms) de encode (13,2 ms) subiría el techo de throughput un 10% a cambio de un salto de
+cola más, y aquí se optimiza latencia, no throughput. El transporte no es una etapa:
+`send_frame` no espera a la red.
+
+**Keyframes bajo demanda, ya implementado.** `kf_mode = VPX_KF_DISABLED` y forzado con
+`VPX_EFLAG_FORCE_KF` en los cuatro disparadores. Se retiró `EncoderConfig::keyframe_interval_secs`:
+sin keyframes periódicos el campo no describía nada, y un campo que se ignora es una API que
+miente. Hay un test de 300 frames con cambios de escena bruscos que falla si alguien devuelve
+`VPX_KF_AUTO`.
+
+**El orden de las comprobaciones en `codificacion::planificar`**, que es un bug esperando a
+ocurrir: la de keyframe va **primero** y el cortocircuito de "no hay nada que codificar"
+**después**. Al revés, un viewer que se reengancha a una máquina inactiva pide keyframe, el
+cortocircuito se dispara antes de mirar la petición, y la imagen no llega nunca. Fijado con
+dos tests, uno en el códec y otro en el host.
+
+**Los rectángulos sucios se acumulan en dos sitios, no en uno.** El evidente es la ranura,
+que al descartar un frame absorbe sus metadatos en el siguiente. El que se pasa por alto es
+el propio bucle de codificación: la cota de fps también descarta frames, y también tiene que
+arrastrarlos. `full_refresh` es pegajoso por la misma razón, y perderlo significa no emitir
+el keyframe que tocaba.
+
+**`--fps` limita de verdad.** Al principio solo se le declaraba al codificador para repartir
+bitrate, y con eso el pipeline daba 59 fps mientras el rate control creía que iban 30: una
+opción que no hacía lo que decía. Ahora la cota se aplica en el hilo de encode, descartando
+en el acto (nunca encolando), así que baja CPU y ancho de banda **sin añadir latencia**.
+
+**El dato interesante que salió de ahí**: sin la cota, este PC sostuvo **59 fps a 1080p** con
+el pipeline completo y 0 descartes. No cierra la pregunta de los 60 fps —falta la latencia
+extremo a extremo del bloque F— pero es la primera evidencia a favor.
+
+**Y la trampa de leer esa cifra**: los FPS de una sesión real los marca cuánto cambia la
+pantalla, no el pipeline, porque DXGI solo entrega frame cuando hay algo nuevo. La misma
+ejecución con el escritorio más quieto dio 41 fps. Cualquier "techo de FPS" que salga de aquí
+sin saturar la pantalla a propósito está midiendo el escritorio, no el código.
+
+**Una sesión ociosa se caía sola a los 30 s, y era inevitable con lo que había.** Los
+keyframes son bajo demanda y una pantalla inmóvil no genera frames: cero tráfico de vídeo.
+El `max_idle_timeout` de quinn son 30 s por defecto y `keep_alive_interval` viene en `None`.
+**Se usa el keepalive de QUIC (PING cada 5 s, timeout de 15 s) y no un datagrama de la
+aplicación**: quinn solo lo emite cuando de verdad no hubo tráfico, vive por debajo de las
+tareas y es lo que mantendrá vivo el mapeo NAT en la Fase 3. El timeout se acorta a 15 s a
+propósito: mientras el host no se entera de que el viewer se fue, cualquier tecla hundida
+sigue hundida. Hay un test de loopback que se queda 18 s en silencio; comprobado que falla
+con `ConnectionLost(TimedOut)` si se quita el keepalive.
+
+**El descarte del receptor iba al revés.** No era solo la profundidad 4: `try_send`
+descartaba **el frame nuevo** al llenarse, así que un consumidor retrasado se quedaba con los
+cuatro más viejos y tiraba el único que valía. Ahora es una ranura de capacidad 1 que desaloja
+**el de secuencia menor**, no el que llegó antes: los streams se leen en paralelo y el orden
+de llegada no es el orden temporal.
+
+**Qué NO se hizo.** El viewer (E2), el camino de input completo con `ReleaseAll` (E3) y la
+sesión entre las dos máquinas (E4). El informe de `--stats` es del bloque F: aquí solo quedan
+los puntos de medida, en `tracing::trace!` dentro del hilo de encode.
+
+**Siguiente paso.** Bloque E2: ventana egui + wgpu que decodifica y pinta, sin input.
 
 ## Métricas actuales
 
@@ -653,14 +761,31 @@ botones no se fusionan nunca.
 > tomar estos números como universales al decidir nada de la Fase 4** hasta medirlos en una
 > máquina con GPU dedicada.
 
-Latencia y ancho de banda siguen sin medir: no hay pipeline completo hasta el bloque E.
+> **Segunda máquina, desde 2026-08-18**: JOSE-VILLA, **NVIDIA RTX 5060 dedicada**, Windows
+> 11, monitor 1920x1080 al 100%. Las filas fechadas el 18 son de esta; las del 17, del
+> portátil. **No se mezclan en una misma fila.**
+
+**La latencia glass-to-glass sigue sin medir**, y no por descuido: hace falta el viewer
+pintando (bloque E2) para tener los dos extremos del cristal. Lo que sí hay ya es el camino
+del host entero medido en un receptor que decodifica.
 
 | Métrica | Valor | Fecha | Cómo se midió |
 |---|---|---|---|
-| Latencia glass-to-glass | — | — | — |
-| FPS a 1080p | — | — | — |
-| Ancho de banda medio | — | — | — |
-| CPU del host | — | — | — |
+> **Cuidado al leer los FPS de una sesión real: no son un techo del pipeline.** Los marca
+> **cuánto cambia la pantalla**, porque DXGI solo entrega frame cuando hay algo nuevo y el
+> host no codifica una pantalla quieta. Dos ejecuciones del mismo binario dan 41 o 59 fps
+> según lo que estuviera pasando en el escritorio. Para un techo de verdad hace falta
+> saturar la pantalla a propósito, y eso es del bloque F.
+
+| Métrica | Valor | Fecha | Cómo se midió |
+|---|---|---|---|
+| Latencia glass-to-glass | — | — | falta el viewer; bloque E2 |
+| FPS a 1080p, cota en 30 | 24,7 fps | 2026-08-18 | `sumidero --segundos 10` por loopback, RTX 5060; escritorio con actividad alta |
+| FPS a 1080p, cota en 60 | 41,2 fps | 2026-08-18 | ídem con `--fps 60`; escritorio con actividad moderada. **Lo limita la pantalla, no el pipeline** |
+| FPS a 1080p, máximo observado del pipeline | 59,0 fps | 2026-08-18 | primera ejecución de E1, antes de existir la cota; 590 frames en 10 s, 0 descartes, pantalla muy activa. Primera evidencia a favor de los 60 fps |
+| Ancho de banda medio a 1080p | 7,7–8,0 Mbps | 2026-08-18 | dos ejecuciones, objetivo 8000 kbps: el rate control cumple |
+| Tamaño de frame, sesión real | keyframe 84–93 KB / inter 22–39 KB | 2026-08-18 | ídem; el inter sube al bajar los fps porque el mismo bitrate se reparte entre menos frames |
+| CPU del host | — | — | pendiente del bloque F |
 | Captura: FPS sostenidos | 59,6 fps | 2026-08-17 | `dump-frames --release --frames 40 --no-save`, 1080p, Radeon integrada |
 | Captura: CPU por frame | ~1,2 ms | 2026-08-17 | `dump-frames --idle 20`, CPU del proceso / frames recibidos |
 | Captura: CPU en reposo | <1,25% de un núcleo | 2026-08-17 | `dump-frames --idle 20`; cota superior, la pantalla no estuvo del todo quieta |
