@@ -43,7 +43,11 @@ bytes = "1.12.1"
 pkg-config = "0.3.34"
 png = "0.18.1"
 quinn = "0.11.11"
-rcgen = "0.14.9"
+# Rango abierto a proposito, no fijado a una version concreta: rcgen 0.14.8 subio su MSRV a
+# 1.88 y el nuestro es 1.85. Con `rust-version = "1.85"` declarado y el resolver de la
+# edicion 2024 (que es consciente de la MSRV), cargo elige 0.14.7, la ultima compatible.
+# Si alguien fija aqui `0.14.8` o posterior, el job `msrv` del CI lo denunciara.
+rcgen = "0.14"
 # La version la marca quinn: rustls 0.24 todavia es prerelease y quinn 0.11 enlaza con la
 # 0.23. Fijarla aqui evita acabar con dos rustls distintas en el arbol.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -65,9 +69,12 @@ yuv = { version = "0.8.17", features = ["fast_mode"] }
 # eframe (`eframe::wgpu`), porque dos versiones distintas en el arbol darian tipos
 # incompatibles justo en la frontera entre el callback de pintado y nuestro pipeline.
 eframe = { version = "0.32.3", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
-# Activa los backends de wgpu de la plataforma (`wgpu/default`). Sin esto, quitarle las
-# features por defecto a eframe deja una instancia sin ningun backend y el fallo aparece en
-# tiempo de ejecucion, no al compilar.
+# TRAMPA, no lo borres: los backends de wgpu (Vulkan/DX12/Metal) se activan a traves de la
+# dependencia debil `egui-wgpu?/default`, que viene de la feature `default` de eframe. Al
+# poner `default-features = false` en eframe se pierde esa activacion y la instancia wgpu se
+# queda sin ningun backend. El sintoma es un PANIC al crear la instancia, en tiempo de
+# ejecucion, no un error de compilacion: de esas que cuestan una tarde entera. Declarar
+# `egui-wgpu` aqui con sus features por defecto devuelve `wgpu/default` al arbol.
 egui-wgpu = "0.32.3"
 pollster = "1.0.1"
 

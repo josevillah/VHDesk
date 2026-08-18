@@ -231,16 +231,16 @@ impl VideoSender {
         vhdesk_proto::encode(&Message::VideoFrame(del_wire), &mut buf)?;
         let bytes = buf.freeze();
 
-        if let Some(anterior) = self.en_vuelo.take()
-            && !anterior.is_finished()
-        {
-            // Abortar suelta el `SendStream` sin terminarlo, y quinn envia RESET_STREAM al
-            // soltarlo. Ese es el mecanismo de descarte.
-            anterior.abort();
-            self.descartados.fetch_add(1, Ordering::Relaxed);
-            // Y aqui esta la clave: acabamos de romper la cadena de referencias, y lo
-            // sabemos nosotros antes que nadie.
-            self.senal.pedir();
+        if let Some(anterior) = self.en_vuelo.take() {
+            if !anterior.is_finished() {
+                // Abortar suelta el `SendStream` sin terminarlo, y quinn envia RESET_STREAM al
+                // soltarlo. Ese es el mecanismo de descarte.
+                anterior.abort();
+                self.descartados.fetch_add(1, Ordering::Relaxed);
+                // Y aqui esta la clave: acabamos de romper la cadena de referencias, y lo
+                // sabemos nosotros antes que nadie.
+                self.senal.pedir();
+            }
         }
 
         // El orden importa y es este: primero se anota la rotura que acaba de provocar el

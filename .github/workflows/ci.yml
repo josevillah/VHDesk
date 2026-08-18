@@ -80,3 +80,29 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+  # La MSRV (rust-version = 1.85) se declara en el manifiesto, y un numero que nadie
+  # comprueba es una garantia falsa: la edicion 2024 y las dependencias podrian haber subido
+  # su minimo sin que lo notaramos. Este job compila con 1.85.0 exacto, en una sola
+  # plataforma a proposito: la incompatibilidad con un rustc viejo es una propiedad del
+  # codigo Rust, no del sistema operativo, y asi no se triplica el coste.
+  #
+  # Si este job se rompe, o se arregla el codigo o se sube la MSRV justificadamente, pero
+  # nunca se deja un `rust-version` que mienta. Ver CLAUDE.md (la MSRV importa de verdad en
+  # la fase 8, cuando el empaquetado se encuentre con rustc antiguos).
+  msrv:
+    name: MSRV 1.85.0
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar toolchain 1.85.0
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: libvpx (Linux)
+        run: sudo apt-get update && sudo apt-get install -y libvpx-dev pkg-config libclang-dev
+
+      - name: Compilar con 1.85.0
+        run: cargo build --workspace --all-targets

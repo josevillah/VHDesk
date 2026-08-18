@@ -80,10 +80,10 @@ impl Drop for PooledBuffer {
         if data.capacity() == 0 {
             return;
         }
-        if let Ok(mut free) = self.free.lock()
-            && free.len() < self.max_retained
-        {
-            free.push(data);
+        if let Ok(mut free) = self.free.lock() {
+            if free.len() < self.max_retained {
+                free.push(data);
+            }
         }
     }
 }
