@@ -16,6 +16,27 @@
 //! Hace falta libvpx en la maquina, y en Windows ademas LLVM para generar los enlaces FFI.
 //! Ver `docs/adr/0002-libvpx-en-windows.md`.
 //!
+//! # Keyframes bajo demanda: no hay keyframe periodico
+//!
+//! El keyframe cada N segundos es una costumbre heredada de transportes con perdida, donde
+//! sirve para que un receptor que perdio datos pueda reengancharse. Aqui el video va por
+//! streams QUIC **fiables**, asi que no hay perdida de la que recuperarse y el keyframe
+//! periodico solo aporta su coste: 36-40 ms de encode y ~100 KB cada vez, un tiron visible.
+//!
+//! Un keyframe sale **solo** cuando alguien llama a [`VideoEncoder::request_keyframe`], y
+//! los cuatro disparadores legitimos son:
+//!
+//! 1. arranque de sesion, porque el viewer no tiene nada sobre lo que apoyarse;
+//! 2. `full_refresh` de la captura (cambio de resolucion, reinicializacion de la
+//!    duplicacion), donde los rectangulos sucios ya no describen el delta;
+//! 3. descarte de un frame por el emisor, que rompe la cadena de referencias y **lo sabe
+//!    en ese instante**, sin esperar a que el receptor se queje;
+//! 4. `KeyframeRequest` del viewer, como red de seguridad ante lo que el emisor no puede
+//!    saber: decodificador desincronizado o perdida real.
+//!
+//! No hay deriva por acumulacion de error que obligue a refrescar: en VP8 los bloques sin
+//! cambios se codifican como *skip*, que es una copia exacta de la referencia.
+//!
 //! # Nota sobre regiones sucias
 //!
 //! libvpx **no acepta rectangulos sucios como entrada**: no hay forma de decirle "solo ha
@@ -47,12 +68,6 @@ pub struct EncoderConfig {
     pub target_bitrate_kbps: u32,
     /// Cota superior de frames por segundo, para que el codificador reparta el bitrate.
     pub max_framerate: u32,
-    /// Segundos entre keyframes periodicos.
-    ///
-    /// Los keyframes son grandes, asi que cuanto mas espaciados mejor para el ancho de
-    /// banda; pero son el unico punto por el que un viewer que acaba de conectarse o que
-    /// perdio datos puede engancharse a la imagen.
-    pub keyframe_interval_secs: u32,
 }
 
 impl EncoderConfig {
@@ -63,7 +78,6 @@ impl EncoderConfig {
             height,
             target_bitrate_kbps: 8_000,
             max_framerate: 60,
-            keyframe_interval_secs: 4,
         }
     }
 }
@@ -133,8 +147,9 @@ pub trait VideoEncoder {
 
     /// Pide que el proximo frame codificado sea un keyframe.
     ///
-    /// Lo usa el host cuando entra un viewer nuevo, cuando la captura senala un refresco
-    /// completo y cuando el viewer avisa de que perdio el hilo del flujo.
+    /// **Es la unica forma de que salga uno**: no hay keyframes periodicos. Ver la nota
+    /// sobre keyframes bajo demanda en la documentacion del crate, que enumera los cuatro
+    /// disparadores.
     fn request_keyframe(&mut self);
 
     /// Comprime un frame.

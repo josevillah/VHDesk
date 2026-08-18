@@ -30,14 +30,19 @@
 //! Al detectar un hueco **no se avanza el ultimo aceptado**, asi que si el frame que
 //! faltaba venia solo reordenado y llega justo despues, encaja como `ultimo + 1` y se
 //! decodifica con normalidad.
+//!
+//! Los frames ya leidos esperan al consumidor en una ranura de [`CAPACIDAD_RANURA`]
+//! huecos que, al llenarse, **desaloja el de secuencia menor**. Ver alli el razonamiento
+//! de por que la capacidad es la que es y por que el descarte va en esa direccion.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use quinn::Connection;
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use vhdesk_proto::{Message, VideoCodec, VideoFrame};
 
@@ -46,15 +51,82 @@ use crate::error::TransportError;
 /// Prioridad de los streams de video, la de referencia.
 const PRIORIDAD_VIDEO: i32 = 0;
 
-/// Frames terminados que se guardan mientras el consumidor no los recoge.
+/// Frames terminados que se retienen mientras el consumidor no los recoge.
 ///
-/// Corto a proposito: acumular frames es acumular latencia. Un consumidor que se retrase
-/// mas de cuatro frames vera huecos, y eso es correcto: mas vale saltar adelante que
-/// arrastrar imagen vieja.
-const PROFUNDIDAD_COLA: usize = 4;
+/// **Uno.** Esta cifra es un compromiso entre dos cosas que es facil confundir, y por eso
+/// esta aqui con nombre en vez de escrita en medio del codigo:
+///
+/// - **Retraso del consumidor**: si el consumidor va lento, cada hueco de cola es un frame
+///   entero de latencia añadida (33 ms a 30 fps) que ademas ya no vale nada cuando se
+///   entrega. De este lado la capacidad correcta es 1, y por eso se empieza en 1.
+/// - **Jitter entre streams paralelos**: los frames se leen en tareas concurrentes, asi
+///   que dos pueden terminar casi a la vez aunque se emitieran separados. Con capacidad 1,
+///   ese solapamiento sub-frame que antes se absorbia ahora produce un hueco, y un hueco
+///   cuesta un keyframe de ~100 KB.
+///
+/// Lo que hace aceptable el 1 es **quien consume**: no es el hilo de pintado sino el de
+/// decodificacion, que drena en un par de milisegundos y vuelve a esperar. La ventana de
+/// colision pasa de "un frame de render" a "un decode", y a esa escala el solapamiento
+/// solo ocurre cuando ya estamos en regimen degradado, donde saltar hacia delante es
+/// justamente lo que queremos.
+///
+/// FASE 1, bloque F: medir 1 contra 2 con latencia extremo a extremo y keyframes por
+/// segundo, en vez de discutirlo. Subirlo a 2 es cambiar este numero y nada mas.
+const CAPACIDAD_RANURA: usize = 1;
 
 /// Cada cuanto se reintenta la peticion de keyframe si no llega ninguno.
 const REINTENTO_KEYFRAME: Duration = Duration::from_secs(1);
+
+/// Aviso compartido de que el proximo frame tiene que ser keyframe.
+///
+/// Existe porque las tres cosas que pueden pedir un keyframe viven en sitios distintos y
+/// ninguna puede llamar a las otras:
+///
+/// - el [`VideoSender`], cuando aborta un stream y rompe la cadena de referencias;
+/// - la tarea que lee el canal de control, cuando llega un `KeyframeRequest` del viewer;
+/// - el hilo de captura, cuando la captura senala `full_refresh`.
+///
+/// Quien lo consume es el hilo de codificacion, que lo consulta **antes de codificar**.
+///
+/// # Por que se consulta y no se consume
+///
+/// [`SenalKeyframe::pendiente`] no borra la peticion: la borra [`VideoSender::send_frame`]
+/// cuando el keyframe **sale de verdad**. Si el hilo de codificacion la consumiera al
+/// leerla, un fallo de codificacion entre medias perderia la peticion y el viewer se
+/// quedaria esperando una imagen que ya nadie va a mandar.
+#[derive(Debug, Clone)]
+pub struct SenalKeyframe(Arc<AtomicBool>);
+
+impl SenalKeyframe {
+    /// Crea la senal con el valor inicial dado.
+    ///
+    /// Arranca en `true` en una sesion nueva: sin un primer keyframe el viewer no tiene
+    /// por donde engancharse.
+    pub fn nueva(pendiente: bool) -> Self {
+        Self(Arc::new(AtomicBool::new(pendiente)))
+    }
+
+    /// Pide un keyframe. Es idempotente: varias peticiones seguidas producen uno solo.
+    pub fn pedir(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Si hay un keyframe pendiente de emitir.
+    pub fn pendiente(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Da la peticion por atendida. La llama el emisor cuando el keyframe sale.
+    fn atendida(&self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+impl Default for SenalKeyframe {
+    fn default() -> Self {
+        Self::nueva(true)
+    }
+}
 
 /// Un frame listo para enviar, **sin numero de secuencia**.
 ///
@@ -98,7 +170,7 @@ pub struct VideoSender {
     conn: Connection,
     en_vuelo: Option<JoinHandle<()>>,
     siguiente_seq: u64,
-    keyframe_pendiente: bool,
+    senal: SenalKeyframe,
     descartados: Arc<AtomicU64>,
 }
 
@@ -110,7 +182,7 @@ impl VideoSender {
             siguiente_seq: 0,
             // El primer frame de una sesion tiene que ser keyframe: sin el, el viewer no
             // tiene por donde engancharse.
-            keyframe_pendiente: true,
+            senal: SenalKeyframe::nueva(true),
             descartados: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -120,8 +192,17 @@ impl VideoSender {
     /// El host debe consultarlo **antes de codificar** y, si es `true`, pedirle un keyframe
     /// al codificador. Se pone a `true` al arrancar la sesion y cada vez que se descarta un
     /// frame, porque en ese momento la cadena de referencias queda rota.
-    pub const fn keyframe_pendiente(&self) -> bool {
-        self.keyframe_pendiente
+    pub fn keyframe_pendiente(&self) -> bool {
+        self.senal.pendiente()
+    }
+
+    /// Handle de la senal de keyframe, para quien tenga que pedirlo desde otra tarea.
+    ///
+    /// Lo necesitan la tarea de control (que recibe `KeyframeRequest` del viewer) y el hilo
+    /// de captura (que ve el `full_refresh`), porque ninguno de los dos tiene acceso a este
+    /// emisor.
+    pub fn senal_keyframe(&self) -> SenalKeyframe {
+        self.senal.clone()
     }
 
     /// Encola un frame, descartando el anterior si aun no ha salido.
@@ -159,11 +240,14 @@ impl VideoSender {
             self.descartados.fetch_add(1, Ordering::Relaxed);
             // Y aqui esta la clave: acabamos de romper la cadena de referencias, y lo
             // sabemos nosotros antes que nadie.
-            self.keyframe_pendiente = true;
+            self.senal.pedir();
         }
 
+        // El orden importa y es este: primero se anota la rotura que acaba de provocar el
+        // descarte y despues se da por atendida si **este** frame es keyframe, porque un
+        // keyframe repara la cadena que el descarte rompio.
         if frame.keyframe {
-            self.keyframe_pendiente = false;
+            self.senal.atendida();
         }
 
         let conn = self.conn.clone();
@@ -342,7 +426,7 @@ impl AmortiguadorKeyframe {
 /// Aceptarlos en serie reintroduciria el bloqueo de cabecera de linea que stream-por-frame
 /// venia a evitar: un frame lento detendria la lectura de todos los posteriores.
 pub struct VideoReceiver {
-    rx: mpsc::Receiver<Resultado>,
+    ranura: Arc<Ranura>,
     politica: PoliticaOrden,
     amortiguador: AmortiguadorKeyframe,
     _aceptador: JoinHandle<()>,
@@ -353,30 +437,24 @@ type Resultado = Result<Box<VideoFrame>, MotivoDescarte>;
 
 impl VideoReceiver {
     pub(crate) fn new(conn: Connection) -> Self {
-        let (tx, rx) = mpsc::channel(PROFUNDIDAD_COLA);
+        let ranura = Arc::new(Ranura::nueva(CAPACIDAD_RANURA));
+        let de_las_tareas = Arc::clone(&ranura);
 
         let aceptador = tokio::spawn(async move {
             while let Ok(recv) = conn.accept_uni().await {
-                let tx = tx.clone();
+                let ranura = Arc::clone(&de_las_tareas);
                 // Una tarea por stream: es lo que conserva la concurrencia.
                 tokio::spawn(async move {
-                    let resultado = leer_frame(recv).await;
-                    // Si la cola esta llena se tira este frame en vez de esperar. Esperar
-                    // seria acumular latencia, que es exactamente lo que no queremos.
-                    //
-                    // No se reporta como descarte porque no hace falta: el frame nunca
-                    // entra en la cola, asi que el consumidor lo vera como un salto en la
-                    // secuencia y la politica lo tratara como cualquier otro hueco. Es la
-                    // misma senal por el mismo camino.
-                    if tx.try_send(resultado).is_err() {
-                        tracing::debug!("cola de video llena; se descarta el frame");
-                    }
+                    ranura.depositar(leer_frame(recv).await);
                 });
             }
+            // La conexion se cerro: hay que despertar al consumidor o se quedaria
+            // esperando un frame que ya no puede llegar.
+            de_las_tareas.cerrar();
         });
 
         Self {
-            rx,
+            ranura,
             politica: PoliticaOrden::nueva(),
             amortiguador: AmortiguadorKeyframe::default(),
             _aceptador: aceptador,
@@ -390,7 +468,11 @@ impl VideoReceiver {
     /// Devuelve [`TransportError::EndpointClosed`] cuando la conexion se cierra y no van a
     /// llegar mas frames.
     pub async fn recv(&mut self) -> Result<RecepcionVideo, TransportError> {
-        let resultado = self.rx.recv().await.ok_or(TransportError::EndpointClosed)?;
+        let resultado = self
+            .ranura
+            .recoger()
+            .await
+            .ok_or(TransportError::EndpointClosed)?;
 
         let frame = match resultado {
             Ok(frame) => frame,
@@ -419,6 +501,137 @@ impl VideoReceiver {
     }
 }
 
+/// Cola acotada de [`CAPACIDAD_RANURA`] frames que, al llenarse, **descarta el mas viejo**.
+///
+/// No es un `mpsc` porque un canal no deja desalojar lo que ya tiene dentro, y aqui el
+/// descarte tiene que ir en la direccion contraria a la habitual: cuando no cabe todo, lo
+/// que sobra es el frame **viejo**, no el que acaba de llegar. Un canal que descarta el
+/// nuevo deja al consumidor arrastrando imagen atrasada, que es justo lo que la politica de
+/// latencia de este proyecto prohibe.
+///
+/// "Mas viejo" es **el de numero de secuencia menor**, no el que llego antes. La diferencia
+/// importa porque los streams se leen en tareas paralelas y el N+1 puede terminar antes que
+/// el N: el orden de llegada no es el orden temporal del contenido.
+struct Ranura {
+    estado: Mutex<EstadoRanura>,
+    aviso: Notify,
+    capacidad: usize,
+}
+
+struct EstadoRanura {
+    cola: VecDeque<Resultado>,
+    cerrada: bool,
+}
+
+impl Ranura {
+    fn nueva(capacidad: usize) -> Self {
+        Self {
+            estado: Mutex::new(EstadoRanura {
+                cola: VecDeque::with_capacity(capacidad.max(1) + 1),
+                cerrada: false,
+            }),
+            aviso: Notify::new(),
+            capacidad: capacidad.max(1),
+        }
+    }
+
+    /// Deja un resultado, desalojando el mas viejo si ya no cabe.
+    fn depositar(&self, resultado: Resultado) {
+        {
+            let Ok(mut estado) = self.estado.lock() else {
+                // Mutex envenenado: hubo un panico en otra tarea mientras lo tenia. Perder
+                // este frame es preferible a propagar el panico por todo el receptor.
+                return;
+            };
+            if estado.cerrada {
+                return;
+            }
+
+            estado.cola.push_back(resultado);
+
+            while estado.cola.len() > self.capacidad {
+                let secuencias: Vec<Option<u64>> = estado
+                    .cola
+                    .iter()
+                    .map(|entrada| entrada.as_ref().ok().map(|frame| frame.sequence))
+                    .collect();
+                let indice = indice_a_desalojar(&secuencias);
+                estado.cola.remove(indice);
+
+                // No se reporta como descarte: el consumidor lo vera como un salto en la
+                // secuencia y la politica lo tratara como cualquier otro hueco. Es la misma
+                // senal por el mismo camino.
+                tracing::debug!(
+                    capacidad = self.capacidad,
+                    "ranura de video llena; se desaloja el frame mas viejo"
+                );
+            }
+        }
+
+        self.aviso.notify_one();
+    }
+
+    /// Recoge el siguiente resultado, esperando si no hay ninguno.
+    ///
+    /// Devuelve `None` cuando la ranura se cerro y ya no queda nada dentro.
+    async fn recoger(&self) -> Option<Resultado> {
+        loop {
+            // `notified()` se arma **antes** de mirar la cola: al reves habria una ventana
+            // en la que un deposito entre la mirada y la espera se perderia y el consumidor
+            // se quedaria dormido con un frame delante.
+            let espera = self.aviso.notified();
+
+            {
+                let Ok(mut estado) = self.estado.lock() else {
+                    return None;
+                };
+                if let Some(resultado) = estado.cola.pop_front() {
+                    return Some(resultado);
+                }
+                if estado.cerrada {
+                    return None;
+                }
+            }
+
+            espera.await;
+        }
+    }
+
+    /// Marca la ranura como cerrada y despierta a quien estuviera esperando.
+    fn cerrar(&self) {
+        if let Ok(mut estado) = self.estado.lock() {
+            estado.cerrada = true;
+        }
+        self.aviso.notify_waiters();
+        self.aviso.notify_one();
+    }
+}
+
+/// Indice de la entrada que hay que desalojar cuando la ranura se pasa de capacidad.
+///
+/// Pura para poder testearla sin red. Las reglas, en orden:
+///
+/// 1. Los avisos sin frame (`None`, o sea un descarte del emisor) se van primero: son
+///    informativos y no llevan imagen que perder.
+/// 2. Entre los frames, el de **secuencia menor**, que es el mas atrasado.
+/// 3. A igualdad, el que este mas cerca del frente, para que la cola no se estanque.
+fn indice_a_desalojar(secuencias: &[Option<u64>]) -> usize {
+    let mut mejor = 0usize;
+
+    for (indice, secuencia) in secuencias.iter().enumerate() {
+        let peor_que_el_actual = match (secuencia, &secuencias[mejor]) {
+            (None, Some(_)) => true,
+            (Some(candidata), Some(actual)) => candidata < actual,
+            _ => false,
+        };
+        if peor_que_el_actual {
+            mejor = indice;
+        }
+    }
+
+    mejor
+}
+
 async fn leer_frame(mut recv: quinn::RecvStream) -> Resultado {
     let limite = vhdesk_proto::MAX_FRAME_LEN + vhdesk_proto::LENGTH_PREFIX_LEN;
 
@@ -438,8 +651,64 @@ async fn leer_frame(mut recv: quinn::RecvStream) -> Resultado {
 
 #[cfg(test)]
 mod tests {
-    use super::{AmortiguadorKeyframe, Decision, PoliticaOrden};
+    use super::{AmortiguadorKeyframe, Decision, PoliticaOrden, SenalKeyframe, indice_a_desalojar};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn se_desaloja_el_frame_de_secuencia_menor_no_el_que_llego_antes() {
+        // Los streams se leen en paralelo, asi que el orden de llegada no es el temporal:
+        // aqui el 8 llego primero y el 7 despues, y el que sobra es el 7.
+        assert_eq!(indice_a_desalojar(&[Some(8), Some(7)]), 1);
+        assert_eq!(indice_a_desalojar(&[Some(7), Some(8)]), 0);
+        assert_eq!(indice_a_desalojar(&[Some(9), Some(4), Some(6)]), 1);
+    }
+
+    #[test]
+    fn un_aviso_sin_frame_se_desaloja_antes_que_cualquier_frame() {
+        // Un `Err` es un descarte del emisor: informativo, sin imagen que perder. Tirarlo
+        // antes que un frame de verdad es siempre la eleccion correcta.
+        assert_eq!(indice_a_desalojar(&[Some(1), None]), 1);
+        assert_eq!(indice_a_desalojar(&[None, Some(1)]), 0);
+        assert_eq!(
+            indice_a_desalojar(&[None, None]),
+            0,
+            "a igualdad se va el mas cercano al frente, para que la cola no se estanque"
+        );
+    }
+
+    #[test]
+    fn la_senal_de_keyframe_arranca_pedida_y_solo_la_borra_quien_la_atiende() {
+        // Arranca pedida porque sin el primer keyframe el viewer no tiene por donde
+        // engancharse.
+        let senal = SenalKeyframe::default();
+        assert!(senal.pendiente());
+
+        senal.atendida();
+        assert!(!senal.pendiente());
+
+        // Consultarla no la consume: si el codificador fallara entre la consulta y la
+        // emision, la peticion tiene que seguir viva.
+        senal.pedir();
+        assert!(senal.pendiente());
+        assert!(senal.pendiente());
+
+        // Y varias peticiones seguidas producen un solo keyframe, no una tormenta.
+        senal.pedir();
+        senal.pedir();
+        senal.atendida();
+        assert!(!senal.pendiente());
+    }
+
+    #[test]
+    fn los_clones_de_la_senal_comparten_estado() {
+        // Es lo que permite que la tarea de control y el hilo de captura pidan keyframe sin
+        // tener acceso al emisor.
+        let senal = SenalKeyframe::nueva(false);
+        let copia = senal.clone();
+
+        copia.pedir();
+        assert!(senal.pendiente(), "la peticion de un clon no llego al otro");
+    }
 
     #[test]
     fn el_primer_frame_tiene_que_ser_keyframe() {

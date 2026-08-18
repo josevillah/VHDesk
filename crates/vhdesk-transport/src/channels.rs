@@ -87,6 +87,60 @@ impl ControlChannel {
     pub async fn recv(&mut self) -> Result<Message, TransportError> {
         recibir_mensaje(&mut self.recv, &mut self.buf).await
     }
+
+    /// Separa el canal en sus dos mitades, para repartirlas entre tareas distintas.
+    ///
+    /// Hace falta en cuanto los dos sentidos los lleva gente distinta, que es el caso del
+    /// host: una tarea espera bloqueada en `recv` a que llegue un `KeyframeRequest`
+    /// mientras otra manda formas de cursor. Con el canal entero no se puede, porque las
+    /// dos operaciones piden `&mut self` y una de ellas esta permanentemente en vuelo.
+    ///
+    /// El stream QUIC de debajo ya venia partido en dos; esto solo deja de esconderlo.
+    pub fn split(self) -> (ControlSender, ControlReceiver) {
+        (
+            ControlSender { send: self.send },
+            ControlReceiver {
+                recv: self.recv,
+                buf: self.buf,
+            },
+        )
+    }
+}
+
+/// Mitad emisora de un [`ControlChannel`] partido.
+pub struct ControlSender {
+    send: SendStream,
+}
+
+impl ControlSender {
+    /// Envia un mensaje de control.
+    ///
+    /// # Errores
+    ///
+    /// Devuelve [`TransportError::Write`] si el stream se cerro.
+    pub async fn send(&mut self, mensaje: &Message) -> Result<(), TransportError> {
+        let bytes = codificar(mensaje)?;
+        self.send.write_all(&bytes).await?;
+        Ok(())
+    }
+}
+
+/// Mitad receptora de un [`ControlChannel`] partido.
+pub struct ControlReceiver {
+    recv: RecvStream,
+    buf: BytesMut,
+}
+
+impl ControlReceiver {
+    /// Espera al siguiente mensaje de control.
+    ///
+    /// # Errores
+    ///
+    /// Devuelve [`TransportError::TruncatedStream`] si el peer cerro el stream en mitad de
+    /// un mensaje.
+    pub async fn recv(&mut self) -> Result<Message, TransportError> {
+        recibir_mensaje(&mut self.recv, &mut self.buf).await
+    }
 }
 
 /// Extremo emisor del canal de input.

@@ -1,7 +1,7 @@
 //! Inyeccion de entrada en el host.
 //!
 //! Expone el trait [`InputInjector`] y esconde detras de `#[cfg]` las implementaciones por
-//! sistema: `SendInput` en Windows, y `uinput` y `CGEvent` en la fase 1b.
+//! sistema: `SendInput` en Windows, y `uinput` y `CGEvent` en la fase 8.
 //!
 //! Este crate hace FFI, asi que puede contener `unsafe` con `// SAFETY:`.
 //!
@@ -66,7 +66,7 @@ mod stub;
 
 use vhdesk_proto::MouseButton;
 
-pub use crate::coords::{EscritorioVirtual, Normalizada, normalizar};
+pub use crate::coords::{EscritorioVirtual, MonitorFisico, Normalizada, a_pixeles, normalizar};
 pub use crate::error::InputError;
 pub use crate::estado::{Liberacion, RegistroPulsaciones};
 pub use crate::scancodes::{TeclaSet1, hid_a_set1};
@@ -124,10 +124,17 @@ pub trait InputInjector {
 
 /// Crea el injector de esta plataforma.
 ///
+/// El objeto devuelto es `Send`: el host recibe el input en una tarea asincrona, que migra
+/// entre hilos del runtime, asi que un injector atado a un hilo concreto no serviria. Las
+/// tres implementaciones lo cumplen sin esfuerzo porque ninguna guarda estado del sistema
+/// operativo: `SendInput`, `uinput` y `CGEvent` reciben todo lo que necesitan en cada
+/// llamada. **No es `Sync`**, y no debe serlo: dos hilos inyectando a la vez desordenarian
+/// las pulsaciones y corromperian el registro de teclas hundidas.
+///
 /// # Errores
 ///
 /// Devuelve [`InputError::UnsupportedPlatform`] en las plataformas sin implementacion.
-pub fn open_injector() -> Result<Box<dyn InputInjector>, InputError> {
+pub fn open_injector() -> Result<Box<dyn InputInjector + Send>, InputError> {
     #[cfg(windows)]
     {
         Ok(Box::new(win32::SendInputInjector::new()?))

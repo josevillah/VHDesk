@@ -61,6 +61,16 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # y es mas preciso.
 yuv = { version = "0.8.17", features = ["fast_mode"] }
 
+# Ventana del viewer. wgpu no se declara aparte a proposito: se usa el que reexporta
+# eframe (`eframe::wgpu`), porque dos versiones distintas en el arbol darian tipos
+# incompatibles justo en la frontera entre el callback de pintado y nuestro pipeline.
+eframe = { version = "0.32.3", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
+# Activa los backends de wgpu de la plataforma (`wgpu/default`). Sin esto, quitarle las
+# features por defecto a eframe deja una instancia sin ningun backend y el fallo aparece en
+# tiempo de ejecucion, no al compilar.
+egui-wgpu = "0.32.3"
+pollster = "1.0.1"
+
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",

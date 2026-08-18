@@ -9,8 +9,22 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+vhdesk-capture.workspace = true
+vhdesk-codec.workspace = true
+vhdesk-input.workspace = true
 vhdesk-proto.workspace = true
+vhdesk-transport.workspace = true
 
 anyhow.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+png.workspace = true
+
+# Viewer de mentira que verifica el host completo antes de que exista ventana: conecta,
+# hace el handshake, decodifica el video de verdad y reporta lo que llego.
+[[example]]
+name = "sumidero"

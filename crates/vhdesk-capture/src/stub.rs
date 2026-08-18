@@ -9,12 +9,12 @@ use crate::error::CaptureError;
 use crate::frame::{MonitorId, MonitorInfo};
 
 pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
-    // FASE 1b: PipeWire ScreenCast con respaldo X11 XShm en Linux, ScreenCaptureKit en
+    // FASE 8: PipeWire ScreenCast con respaldo X11 XShm en Linux, ScreenCaptureKit en
     // macOS. Hasta entonces el error dice exactamente lo que pasa.
     Err(CaptureError::UnsupportedPlatform)
 }
 
 pub fn open_capturer(_id: MonitorId) -> Result<Box<dyn ScreenCapturer>, CaptureError> {
-    // FASE 1b: ver arriba.
+    // FASE 8: ver arriba.
     Err(CaptureError::UnsupportedPlatform)
 }

@@ -14,6 +14,7 @@
 //! hay que tocar estan marcados con `// FASE 2:` en este archivo.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -27,6 +28,56 @@ use crate::error::TransportError;
 /// Sirve para que un QUIC ajeno que llegue a este puerto se rechace en el handshake en
 /// lugar de avanzar hasta el protocolo y fallar alli con un error confuso.
 pub const ALPN: &[u8] = b"vhdesk/1";
+
+/// Cuanto se aguanta sin recibir nada del peer antes de dar la conexion por muerta.
+///
+/// Mas corto que los 30 s por defecto de quinn a proposito. Aqui detectar rapido un peer
+/// muerto no es una optimizacion: mientras el host no se entera de que el viewer ya no
+/// esta, cualquier tecla que quedara hundida sigue hundida. Ver la seccion de teclas
+/// pegadas en `vhdesk-input`.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Cada cuanto se manda un PING cuando no hay nada que enviar.
+///
+/// **Sin esto la sesion se cae sola con la pantalla quieta.** No es un problema teorico:
+/// los keyframes son bajo demanda y un escritorio inmovil no genera frames, asi que un
+/// usuario que se levante a por un cafe deja de producir trafico de video por completo. Con
+/// el `max_idle_timeout` por defecto de quinn (30 s) y `keep_alive_interval` en `None`, que
+/// son los valores que traia esta configuracion, la conexion moria en medio minuto.
+///
+/// # Por que el keepalive de QUIC y no un datagrama de la aplicacion
+///
+/// Un `Message::Ping` periodico por datagrama haria lo mismo peor: QUIC ya tiene el frame
+/// PING para exactamente esto, quinn lo emite solo cuando de verdad no hubo trafico (un
+/// temporizador propio lo mandaria tambien en mitad de una sesion activa), y al vivir por
+/// debajo de la aplicacion sigue funcionando aunque las tareas de arriba esten ocupadas.
+/// Ademas es lo que mantendra vivo el mapeo NAT en la fase 3, que es un problema de la capa
+/// de transporte y no del protocolo.
+///
+/// El intervalo tiene que quedar **bien por debajo** de [`IDLE_TIMEOUT`]: con 5 s contra 15
+/// caben dos PING perdidos antes de que la conexion se de por muerta.
+pub const KEEPALIVE: Duration = Duration::from_secs(5);
+
+/// Ajustes de transporte comunes a los dos extremos.
+///
+/// El timeout de inactividad efectivo es el **minimo** de lo que anuncian los dos peers, asi
+/// que fijarlo en un solo lado no basta y por eso esto se aplica al cliente y al servidor.
+fn transport_config() -> Arc<quinn::TransportConfig> {
+    let mut config = quinn::TransportConfig::default();
+
+    config.keep_alive_interval(Some(KEEPALIVE));
+    // `IdleTimeout` no admite cualquier duracion (esta acotado por el maximo que cabe en un
+    // `VarInt`), pero 15 s entran de sobra; si algun dia alguien pone aqui algo absurdo,
+    // preferimos el valor por defecto de quinn a un panico en el arranque.
+    match quinn::IdleTimeout::try_from(IDLE_TIMEOUT) {
+        Ok(timeout) => {
+            config.max_idle_timeout(Some(timeout));
+        }
+        Err(error) => tracing::warn!(%error, "IDLE_TIMEOUT invalido; se usa el de quinn"),
+    }
+
+    Arc::new(config)
+}
 
 /// Identidad TLS de esta instalacion.
 ///
@@ -86,7 +137,9 @@ pub fn server_config(identity: Identity) -> Result<quinn::ServerConfig, Transpor
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
     let quic = QuicServerConfig::try_from(tls)?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
+    config.transport_config(transport_config());
+    Ok(config)
 }
 
 /// Configuracion de cliente que **acepta cualquier certificado**.
@@ -104,7 +157,9 @@ pub fn client_config_insecure() -> Result<quinn::ClientConfig, TransportError> {
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
     let quic = QuicClientConfig::try_from(tls)?;
-    Ok(quinn::ClientConfig::new(Arc::new(quic)))
+    let mut config = quinn::ClientConfig::new(Arc::new(quic));
+    config.transport_config(transport_config());
+    Ok(config)
 }
 
 /// Verificador que da por bueno cualquier certificado de servidor.
