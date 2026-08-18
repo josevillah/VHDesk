@@ -108,6 +108,10 @@ Dos decisiones de forma que se derivan del ADR-0001 y que es fácil romper por d
 ## Convenciones de código
 
 - Rust estable, **edición 2024**. `cargo fmt` con la config por defecto.
+- **La MSRV se comprueba en Windows y en Linux.** El job `msrv` corre en las dos: todo lo
+  que hay tras `#[cfg(windows)]` —los módulos `win32` de captura e input, que son el grueso
+  de la fase 1— no se compila en Linux, así que un job que solo mirase ahí daría por buena
+  una MSRV que el código que más importa no cumple.
 - **MSRV = 1.85**, y ahora es un hecho, no una afirmación: el job `msrv` del CI compila el
   workspace con 1.85.0 exacto. La MSRV baja importa de verdad a partir de la fase 8, cuando
   el empaquetado para distribuciones de Linux se encuentre con rustc antiguos; hoy, con
@@ -839,6 +843,44 @@ querer `Rgba8UnormSrgb`), decisión del bloque E2.
 
 **Siguiente paso.** El resto de E2: ventana eframe y subir el frame desde el callback de
 pintado de wgpu, sin input.
+
+### 2026-08-18 — Fase 1, bloque E2 (completo): la ventana del viewer
+
+**Qué se hizo.** `encuadre.rs` puro con 11 tests, `sesion.rs` con el handshake y el bucle de
+vídeo, `app.rs` con el callback de pintado de `egui_wgpu`, `cli.rs` con `--connect` y
+`--vsync`. Verificado contra `127.0.0.1` en el portátil: **182 frames decodificados en 8 s,
+0 huecos, 1 keyframe pedido** (el de arranque).
+
+**El `target_format` no era un valor fijo, y esta máquina lo demuestra.** El renderer lo
+tenía cableado a `Rgba8Unorm`; el portátil (Radeon integrada, backend **Vulkan**) pide
+**`Bgra8Unorm`**. wgpu exige que el `ColorTargetState` coincida exactamente con el
+attachment, así que con el valor fijo el viewer no habría pintado aquí. Ahora se consulta a
+eframe y **se registra con `info!` al arrancar**, junto con el adaptador y el backend: es el
+primer dato que mirar cuando una máquina pinta y otra no.
+
+**El frame no cruza hilos.** Decodificación y subida a textura ocurren seguidas en el mismo
+hilo. Mandarlo a otro obligaría a copiar 3,1 MiB por frame, y esa copia no compra nada
+porque la subida a la GPU hay que hacerla igual. Lo que cruza al hilo de pintado son
+texturas ya rellenas, no píxeles. De ahí que el runtime de la sesión sea de un solo hilo: el
+decodificador de libvpx no es `Send`, y el bucle de vídeo va con `block_on` en vez de
+`spawn` para no tener que serlo; control y datagramas, que sí son `Send`, van aparte.
+
+**Estados visibles, decididos y no improvisados.** Conectando, negociando, esperando el
+primer frame, activa, y terminada distinguiendo cierre limpio de conexión perdida. Nunca se
+deja la ventana en negro: una ventana negra es indistinguible de un cuelgue. El paso de
+"esperando el primer frame" es real y se ve: entre el handshake y el primer keyframe pasan
+las decenas de ms que cueste codificarlo, y más si la pantalla remota está quieta.
+
+**Comprobado que el viewer se entera de que el host murió.** Matando el host a lo bruto, la
+sesión pasa a terminada por el idle timeout de 15 s y la ventana lo dice. La primera medición
+esperó solo 4 s y me hizo pensar que había un defecto; no lo había, la prueba era corta.
+
+**Las bandas negras son del `clear_color` de la ventana**, no de un rectángulo pintado: el
+vídeo se dibuja únicamente dentro de su viewport y lo de alrededor es el fondo.
+
+**Qué NO se hizo.** El camino de input (E3) y el dibujado del cursor. La posición del cursor
+remoto ya se recibe y se guarda, pero no se pinta: el cursor local ya se ve encima de la
+ventana y pintar el remoto sin su forma real daría dos punteros.
 
 ## Métricas actuales
 

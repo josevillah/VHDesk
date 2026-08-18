@@ -3373,10 +3373,12 @@ dependencies = [
  "eframe",
  "egui-wgpu",
  "pollster 1.0.1",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "vhdesk-codec",
  "vhdesk-proto",
+ "vhdesk-transport",
 ]
 
 [[package]]

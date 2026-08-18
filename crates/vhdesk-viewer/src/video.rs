@@ -66,10 +66,20 @@ fn crear_plano(device: &wgpu::Device, width: u32, height: u32, etiqueta: &str) -
 impl VideoRenderer {
     /// Crea el pipeline para un video de las dimensiones dadas.
     ///
-    /// El formato de destino queda fijado en `Rgba8Unorm`: es el que sirve para verificar
-    /// los colores sin transformacion sRGB y el que este modulo espera en
-    /// [`VideoRenderer::render`].
-    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+    /// `target_format` **tiene que ser el de la superficie donde se va a pintar**, y no un
+    /// valor fijo: wgpu exige que el formato del `ColorTargetState` coincida exactamente
+    /// con el del attachment, y ese formato lo elige el backend segun la GPU y el sistema
+    /// de ventanas. En la maquina de desarrollo con Radeon integrada y en la de RTX puede
+    /// salir distinto, asi que el viewer lo consulta a eframe y lo registra al arrancar.
+    ///
+    /// El test de color usa `Rgba8Unorm` porque es el que permite comprobar los valores sin
+    /// que una conversion sRGB los mueva por el camino.
+    pub fn new(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        target_format: wgpu::TextureFormat,
+    ) -> Self {
         // Las dimensiones vienen del decodificador, siempre validas; un cero aqui es un
         // error de programacion, no un dato que haya que tolerar en tiempo de ejecucion.
         assert!(width > 0 && height > 0, "dimensiones de video nulas");
@@ -170,7 +180,7 @@ impl VideoRenderer {
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: target_format,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -232,7 +242,24 @@ impl VideoRenderer {
         );
     }
 
-    /// Pinta el frame subido en `destino`.
+    /// Emite las ordenes de dibujo en un paso ya abierto.
+    ///
+    /// Es lo que necesita el callback de pintado de egui, que entrega un `RenderPass` en
+    /// curso en lugar de dejar abrir uno propio. El llamante decide el viewport, que es
+    /// donde se aplica el encuadre con bandas negras.
+    pub fn draw(&self, paso: &mut wgpu::RenderPass<'_>) {
+        paso.set_pipeline(&self.pipeline);
+        paso.set_bind_group(0, &self.bind_group, &[]);
+        // Tres vertices sin buffer: el shader genera un triangulo que cubre la pantalla a
+        // partir del indice. Un quad seria un vertice mas y una arista diagonal de mas.
+        paso.draw(0..3, 0..1);
+    }
+
+    /// Pinta el frame subido en `destino`, abriendo su propio paso.
+    ///
+    /// Lo usa el test de color, que no tiene un paso de egui en el que meterse. En el
+    /// binario no se llama: alli el paso lo abre egui y se dibuja con [`VideoRenderer::draw`].
+    #[allow(dead_code)]
     pub fn render(&self, encoder: &mut wgpu::CommandEncoder, destino: &wgpu::TextureView) {
         let mut paso = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("paso I420"),
@@ -248,9 +275,7 @@ impl VideoRenderer {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        paso.set_pipeline(&self.pipeline);
-        paso.set_bind_group(0, &self.bind_group, &[]);
-        paso.draw(0..3, 0..1);
+        self.draw(&mut paso);
     }
 
     /// Anchura del video para el que se creo.
@@ -413,7 +438,8 @@ mod tests {
         };
 
         let (ancho, alto) = (16u32, 16u32);
-        let mut renderer = VideoRenderer::new(&device, ancho, alto);
+        let mut renderer =
+            VideoRenderer::new(&device, ancho, alto, wgpu::TextureFormat::Rgba8Unorm);
 
         // Orden (B, G, R), el mismo que usa la tabla de referencia del codec: rojo es
         // (0, 0, 255) y azul es (255, 0, 0).
@@ -472,7 +498,8 @@ mod tests {
         };
 
         let (ancho, alto) = (16u32, 16u32);
-        let mut renderer = VideoRenderer::new(&device, ancho, alto);
+        let mut renderer =
+            VideoRenderer::new(&device, ancho, alto, wgpu::TextureFormat::Rgba8Unorm);
 
         // Plano Y blanco (235) con 8 bytes de relleno negro por fila: stride 24, que no es
         // multiplo de 256. Si write_texture leyera el relleno, las filas saldrian grises.

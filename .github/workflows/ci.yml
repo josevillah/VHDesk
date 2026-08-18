@@ -83,16 +83,25 @@ jobs:
 
   # La MSRV (rust-version = 1.85) se declara en el manifiesto, y un numero que nadie
   # comprueba es una garantia falsa: la edicion 2024 y las dependencias podrian haber subido
-  # su minimo sin que lo notaramos. Este job compila con 1.85.0 exacto, en una sola
-  # plataforma a proposito: la incompatibilidad con un rustc viejo es una propiedad del
-  # codigo Rust, no del sistema operativo, y asi no se triplica el coste.
+  # su minimo sin que lo notaramos.
   #
-  # Si este job se rompe, o se arregla el codigo o se sube la MSRV justificadamente, pero
+  # **Corre en las dos plataformas, y Windows no es opcional.** La incompatibilidad con un
+  # rustc viejo es una propiedad del codigo Rust y no del sistema operativo, pero solo del
+  # codigo que se compila: todo lo que hay detras de `#[cfg(windows)]` —los modulos win32 de
+  # captura e input, que son el grueso de la fase 1— no existe en un build de Linux. Un job
+  # que solo mire Linux daria por buena una MSRV que el codigo que mas nos importa no
+  # cumple.
+  #
+  # Si alguno se rompe, o se arregla el codigo o se sube la MSRV justificadamente, pero
   # nunca se deja un `rust-version` que mienta. Ver CLAUDE.md (la MSRV importa de verdad en
   # la fase 8, cuando el empaquetado se encuentre con rustc antiguos).
   msrv:
-    name: MSRV 1.85.0
-    runs-on: ubuntu-latest
+    name: MSRV 1.85.0 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -102,7 +111,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: libvpx (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libvpx-dev pkg-config libclang-dev
+
+      - name: Cache de vcpkg (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_installed
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+
+      - name: libvpx (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --triplet x64-windows-static-md
+          $raiz = "$PWD\vcpkg_installed\x64-windows-static-md"
+          "VPX_LIB_DIR=$raiz\lib"     | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "VPX_INCLUDE_DIR=$raiz\include" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - name: Compilar con 1.85.0
         run: cargo build --workspace --all-targets
