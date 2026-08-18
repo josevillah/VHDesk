@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod video;
+
 use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
 

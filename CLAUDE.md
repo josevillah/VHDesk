@@ -108,6 +108,12 @@ Dos decisiones de forma que se derivan del ADR-0001 y que es fácil romper por d
 ## Convenciones de código
 
 - Rust estable, **edición 2024**. `cargo fmt` con la config por defecto.
+- **MSRV = 1.85**, y ahora es un hecho, no una afirmación: el job `msrv` del CI compila el
+  workspace con 1.85.0 exacto. La MSRV baja importa de verdad a partir de la fase 8, cuando
+  el empaquetado para distribuciones de Linux se encuentre con rustc antiguos; hoy, con
+  Windows primero y toolchain propia, es barata de mantener pero no crítica. Si el job se
+  rompe, o se arregla el código o se sube la MSRV justificadamente: nunca se deja un
+  `rust-version` que mienta.
 - `cargo clippy --all-targets --all-features -- -D warnings` debe pasar limpio.
 - Errores: `thiserror` en librerías, `anyhow` en binarios. Prohibido `unwrap()` y
   `expect()` en código de librería (`clippy.toml` lo hace fallar; en tests usa `expect`
@@ -777,6 +783,63 @@ los puntos de medida, en `tracing::trace!` dentro del hilo de encode.
 
 **Siguiente paso.** Bloque E2: ventana egui + wgpu que decodifica y pinta, sin input.
 
+### 2026-08-18 — Fase 1, bloque E2 (a medias): módulo wgpu + test de color
+
+**Qué se hizo.** El módulo de render del viewer (`vhdesk-viewer/src/video.rs` +
+`shader_i420.wgsl`): tres texturas R8Unorm (Y/U/V) + un shader que aplica la matriz inversa
+de BT.601 en el pintado, con triángulo a pantalla completa y sin pasar por el teselador de
+egui. `VideoRenderer::new` crea el pipeline, `upload` sube los planos con su stride y
+`render` pinta a una vista destino. El test de color hace el viaje de ida y vuelta
+BGRA → I420 (CPU, la misma conversión que usa el host) → RGBA (GPU) y lo compara contra el
+color de partida.
+
+**La divergencia medida, ya con el número real.** Para los cinco colores de referencia el
+viaje de ida y vuelta cuesta como mucho **1 unidad** en un canal y 0 en el resto: negro,
+blanco y azul exactos; verde sale B=1; rojo sale R=254 (la Y=81 de rojo pierde el 0,481
+que redondea el forward). Nada de advertencias infladas: el shader no desvía nada medible
+más allá del redondeo de 8 bits del propio BT.601 limitado.
+
+**El dato de `write_texture`, confirmado en el código de wgpu y no solo observado.** La
+alineación a `COPY_BYTES_PER_ROW_ALIGNMENT` (256 bytes) **no aplica a `Queue::write_texture`**,
+solo a `copy_buffer_to_texture` y `copy_texture_to_buffer`. La documentación de
+`wgpu-types` lo dice explícito y el validador pasa `need_copy_aligned_rows = false` para
+`write_texture`. Por eso el stride de libvpx (que alinea a 16/32, no a 256) se sube tal cual
+sin rellenar filas ni copiar a un buffer apretado. Hay un test
+(`write_texture_ignora_el_relleno_de_fila`) que lo fija con un stride 24 que no es múltiplo
+de 256 y con relleno negro: si el relleno se colara, el test fallaría. La Fase 4 quiere este
+dato a mano cuando mire la conversión en GPU.
+
+**Los tests de color se omiten sin GPU.** Piden adaptador y, si el runner no tiene uno (CI
+sin pantalla), se saltan con un mensaje en vez de fallar. En esta máquina (RTX 5060) corren
+de verdad.
+
+**La MSRV estaba rota, tal como se sospechaba.** Dos causas, ambas arregladas:
+
+1. `rcgen = "0.14.9"` subió su MSRV a **1.88** (publicado 2026-08-10). Se dejó el rango en
+   `rcgen = "0.14"` y el resolver de la edición 2024 (consciente de la MSRV) elige 0.14.7,
+   la última compatible. El job `msrv` del CI lo vigila.
+2. Nuestro propio código usaba **let-chains** (`if let X = y && cond`), estabilizadas en
+   1.88: `vhdesk-capture/src/pool.rs` y `vhdesk-transport/src/video.rs`. Se reescribieron
+   como `if` anidados, idénticos en comportamiento.
+
+**Job `msrv` añadido al CI**: compila `--workspace --all-targets` con 1.85.0 exacto en una
+sola plataforma (Linux). Verificado localmente: `cargo +1.85.0 check --workspace
+--all-targets` pasa limpio.
+
+**La trampa de eframe queda escrita en el Cargo.toml de la raíz.** Los backends de wgpu se
+activan vía la dependencia débil `egui-wgpu?/default` que trae la feature `default` de
+eframe; con `default-features = false` desaparecen y la instancia falla **en tiempo de
+ejecución** (panic al crear la instancia), no al compilar. Declarar `egui-wgpu` aparte los
+devuelve. Ver el comentario en `Cargo.toml`, que es donde lo va a leer quien lo toque.
+
+**Qué NO se hizo.** La ventana de egui (E2 propiamente), el camino de input con
+`ReleaseAll` (E3) y la sesión entre máquinas (E4). El `render` pinta a `Rgba8Unorm`; al
+integrarlo en eframe habrá que casar ese formato con el de la superficie (egui-wgpu puede
+querer `Rgba8UnormSrgb`), decisión del bloque E2.
+
+**Siguiente paso.** El resto de E2: ventana eframe y subir el frame desde el callback de
+pintado de wgpu, sin input.
+
 ## Métricas actuales
 
 > **Máquina de referencia de todas las mediciones**: Lenovo 82XM, AMD Ryzen 7 5825U con
@@ -810,6 +873,7 @@ del host entero medido en un receptor que decodifica.
 | Métrica | Valor | Fecha | Cómo se midió |
 |---|---|---|---|
 | Latencia glass-to-glass | — | — | falta el viewer; bloque E2 |
+| Divergencia de color BGRA→I420→RGBA (GPU) | máx 1 por canal, 0 en el resto | 2026-08-18 | test de color del viewer (`el_viaje_de_ida_y_vuelta_mantiene_el_color_de_referencia`), RTX 5060; 5 primarios. Verde B=1, rojo R=254 |
 | FPS a 1080p, cota en 30 | 24,7 fps | 2026-08-18 | `sumidero --segundos 10` por loopback, RTX 5060; escritorio con actividad alta |
 | FPS a 1080p, cota en 60 | 41,2 fps | 2026-08-18 | ídem con `--fps 60`; escritorio con actividad moderada. **Lo limita la pantalla, no el pipeline** |
 | FPS a 1080p, máximo observado del pipeline | 59,0 fps | 2026-08-18 | primera ejecución de E1, antes de existir la cota; 590 frames en 10 s, 0 descartes, pantalla muy activa. Primera evidencia a favor de los 60 fps |

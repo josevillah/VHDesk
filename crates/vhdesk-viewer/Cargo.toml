@@ -18,4 +18,7 @@ eframe.workspace = true
 egui-wgpu.workspace = true
 
 [dev-dependencies]
+# Para el test de color: genera el I420 de referencia con la misma conversion que usa el
+# host, de modo que el viaje de ida y vuelta (CPU -> GPU) quede probado de punta a punta.
+vhdesk-codec.workspace = true
 pollster.workspace = true
