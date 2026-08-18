@@ -15,8 +15,10 @@
 //! | error de conexion | el host lo detecta solo: la lectura falla |
 //! | **perdida de foco del viewer** | **solo puede venir del viewer** |
 //!
-//! Los dos primeros se resuelven aqui, en [`bucle`], que llama a `liberar_todo` pase lo que
-//! pase al salir. El tercero necesita que el viewer lo diga, y es trabajo del bloque E3.
+//! Los dos primeros se resuelven en [`bucle`], que llama a `liberar_todo` pase lo que pase
+//! al salir. El tercero no lo puede saber el host, asi que el viewer lo dice enviando un
+//! [`ReleaseAll`] por el canal de input, y aqui se atiende sin terminar la sesion: perder el
+//! foco es cotidiano y no significa que el viewer se vaya.
 
 use anyhow::Result;
 use vhdesk_input::{InputInjector, MonitorFisico, a_pixeles};
@@ -102,13 +104,21 @@ async fn recibir(
             }
         };
 
-        let Message::InputEvent(evento) = mensaje else {
+        let evento = match mensaje {
+            Message::InputEvent(evento) => evento,
+            // El viewer perdio el foco, se minimizo o bloquearon su sesion. La sesion sigue
+            // viva: lo unico que pide es que nada quede hundido mientras el no mira.
+            Message::ReleaseAll(_) => {
+                if let Err(error) = injector.liberar_todo() {
+                    tracing::warn!(%error, "no se pudo soltar lo hundido al perder el foco");
+                } else {
+                    tracing::debug!("el viewer perdio el foco: soltado todo lo hundido");
+                }
+                continue;
+            }
             // El canal de input solo lleva eventos de entrada. Cualquier otra cosa es un
             // peer que no habla este protocolo.
-            anyhow::bail!(
-                "mensaje inesperado en el canal de input: {}",
-                mensaje.name()
-            );
+            otro => anyhow::bail!("mensaje inesperado en el canal de input: {}", otro.name()),
         };
 
         if let Err(error) = aplicar(evento, monitor_servido, geometria, injector) {
@@ -291,6 +301,85 @@ mod tests {
                 e.liberaciones, 1,
                 "el host se quedo con Ctrl hundido: la maquina remota queda inservible y el \
                  sintoma aparece cuando ya nadie lo relaciona con la sesion"
+            );
+        });
+    }
+
+    /// Un `ReleaseAll` suelta las teclas **sin** terminar la sesion.
+    ///
+    /// Perder el foco es cotidiano —Alt+Tab, minimizar, bloquear la pantalla— y no
+    /// significa que el viewer se vaya. Si esto cortara la sesion, el mecanismo que existe
+    /// para evitar teclas pegadas seria peor que la enfermedad.
+    #[tokio::test]
+    async fn release_all_suelta_lo_hundido_y_la_sesion_sigue_viva() {
+        vhdesk_transport::install_crypto_provider();
+
+        let local = SocketAddr::from(([127, 0, 0, 1], 0));
+        let host_endpoint = vhdesk_transport::Endpoint::bind(local).expect("endpoint del host");
+        let addr = host_endpoint.local_addr().expect("direccion");
+        let viewer_endpoint = vhdesk_transport::Endpoint::bind(local).expect("endpoint del viewer");
+
+        let espia = EspiaCompartido::default();
+        let mut copia = espia.clone();
+
+        let servidor = tokio::spawn(async move {
+            let sesion = host_endpoint.accept().await.expect("aceptar");
+            let receptor = sesion.accept_input().await.expect("aceptar input");
+            bucle(receptor, 0, GEOMETRIA, &mut copia)
+                .await
+                .expect("bucle");
+            drop(sesion);
+        });
+
+        let viewer = viewer_endpoint.connect(addr).await.expect("conectar");
+        let mut input = viewer.open_input().await.expect("abrir input");
+
+        // Alt hundido y despues Alt+Tab: la ventana pierde el foco con la tecla dentro.
+        input
+            .send(&Message::InputEvent(InputEvent::Key {
+                scancode: 0x0007_00e2,
+                pressed: true,
+            }))
+            .await
+            .expect("enviar la pulsacion");
+        input
+            .send(&Message::ReleaseAll(vhdesk_proto::ReleaseAll))
+            .await
+            .expect("enviar el ReleaseAll");
+
+        esperar_a(
+            || espia.ver(|e| e.liberaciones >= 1),
+            "la liberacion por perdida de foco",
+        )
+        .await;
+
+        // Y la sesion sigue: se manda otra tecla y tiene que inyectarse igual.
+        input
+            .send(&Message::InputEvent(InputEvent::Key {
+                scancode: 0x04,
+                pressed: true,
+            }))
+            .await
+            .expect("enviar despues del ReleaseAll");
+
+        esperar_a(
+            || espia.ver(|e| e.teclas.len() == 2),
+            "la tecla posterior al ReleaseAll: el canal no deberia haberse cerrado",
+        )
+        .await;
+
+        viewer.close();
+        drop(viewer_endpoint);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), servidor)
+            .await
+            .expect("el bucle no termino tras irse el viewer")
+            .expect("tarea del host");
+
+        espia.ver(|e| {
+            assert_eq!(
+                e.liberaciones, 2,
+                "una liberacion por el ReleaseAll y otra al terminar el bucle"
             );
         });
     }

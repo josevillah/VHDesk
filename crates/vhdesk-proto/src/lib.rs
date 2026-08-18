@@ -44,5 +44,5 @@ pub use message::{
     AudioFrame, AuthMethod, AuthRequest, AuthResponse, AuthResult, ClipboardFormat,
     ClipboardUpdate, Cursor, Hello, InputEvent, KeyframeReason, KeyframeRequest,
     MAX_ANNOUNCED_CODECS, MAX_PEER_NAME_LEN, Message, MouseButton, PROTOCOL_VERSION, Ping, Pong,
-    Role, VideoFrame,
+    ReleaseAll, Role, VideoFrame,
 };

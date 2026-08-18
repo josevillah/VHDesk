@@ -10,6 +10,7 @@ license.workspace = true
 
 [dependencies]
 vhdesk-codec.workspace = true
+vhdesk-input.workspace = true
 vhdesk-proto.workspace = true
 vhdesk-transport.workspace = true
 
@@ -19,6 +20,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 eframe.workspace = true
 egui-wgpu.workspace = true
+
+# Solo para llegar a `with_msg_hook`, por donde el viewer ve los `WM_INPUT` de Raw Input.
+egui-winit.workspace = true
 
 [dev-dependencies]
 # El test de color genera el I420 de referencia con la misma conversion que usa el host, de

@@ -1,7 +1,20 @@
-//! Inyeccion de entrada en el host.
+//! Entrada de teclado y raton: **capturarla** en el viewer e **inyectarla** en el host.
 //!
-//! Expone el trait [`InputInjector`] y esconde detras de `#[cfg]` las implementaciones por
-//! sistema: `SendInput` en Windows, y `uinput` y `CGEvent` en la fase 8.
+//! Las dos direcciones viven juntas porque comparten la tabla de traduccion de teclas
+//! ([`scancodes`]) y son inversas exactas la una de la otra. Separarlas en dos crates
+//! duplicaria esa tabla, y una tabla duplicada que discrepa produce teclas que escriben
+//! otra cosa.
+//!
+//! | direccion | quien la usa | trait o funcion | Windows |
+//! |---|---|---|---|
+//! | inyectar | host | [`InputInjector`] | `SendInput` |
+//! | capturar | viewer | [`captura_win32::hook_de_mensajes`] | Raw Input |
+//!
+//! La inyeccion esconde detras de `#[cfg]` las implementaciones por sistema: `SendInput` en
+//! Windows, y `uinput` y `CGEvent` en la fase 8. La captura tiene hoy **solo la de
+//! Windows**, porque su forma no es la de un trait: depende de como cada sistema de
+//! ventanas entregue los eventos. FASE 8: el equivalente en X11 es `XI2` con
+//! `XISelectEvents` sobre la ventana con foco, y en macOS `NSEvent` con monitores locales.
 //!
 //! Este crate hace FFI, asi que puede contener `unsafe` con `// SAFETY:`.
 //!
@@ -15,6 +28,23 @@
 //! usuario tiene el raton en su ventana, teniendo en cuenta el escalado, el tamano de la
 //! ventana y el monitor remoto que se este viendo, es responsabilidad del bloque E. Aqui
 //! entrarian coordenadas ya traducidas.
+//!
+//! # Limitacion conocida: los atajos que Windows se queda por el camino
+//!
+//! El viewer captura con Raw Input **sin** `RIDEV_NOLEGACY`, asi que Windows sigue
+//! procesando localmente los mensajes de teclado normales. Consecuencia: algunos atajos
+//! actuan en la maquina **local** ademas de viajar al host. En la fase 1 se asume y se
+//! documenta, en vez de fingir que funciona:
+//!
+//! | atajo | que pasa hoy |
+//! |---|---|
+//! | **Alt+Tab** | viaja al host **y** cambia de aplicacion aqui. Al perder el foco sale un `ReleaseAll`, asi que el Alt no queda hundido al otro lado, pero el remoto ve un Alt+Tab a medias |
+//! | **Tecla Windows** | igual: viaja, y ademas abre el menu de inicio local |
+//! | **Ctrl+Alt+Supr** | **no se captura nunca**, ni con Raw Input ni con un hook. Es la secuencia de atencion segura y ningun proceso de usuario puede verla |
+//!
+//! Capturar el teclado entero exigiria `RIDEV_NOLEGACY`, que dejaria sin teclado a la
+//! propia interfaz del viewer. Ctrl+Alt+Supr no lo arregla ni eso: para enviarlo al host
+//! hara falta un comando explicito del protocolo. Las dos cosas son de fases posteriores.
 //!
 //! # Limitacion conocida: la distribucion de teclado que manda es la del host
 //!
@@ -41,22 +71,20 @@
 //! relaciona con la causa.
 //!
 //! Por eso el injector lleva registro de lo que hunde y expone
-//! [`InputInjector::liberar_todo`]. **El bloque E tiene que llamarlo** al cerrar la sesion,
-//! cuando la ventana del viewer pierde el foco, y ante cualquier error de conexion.
-//!
-//! # Nota para el bloque E: fusionar los movimientos de raton
-//!
-//! Un raton de 1000 Hz genera mil eventos por segundo, y no tiene sentido mandar mas de uno
-//! por frame: solo cuenta la ultima posicion. El viewer debe quedarse con el ultimo
-//! movimiento pendiente y descartar los anteriores antes de enviar. Los **botones** no se
-//! fusionan nunca: cada pulsacion y cada liberacion importan.
+//! [`InputInjector::liberar_todo`]. Los tres disparadores son cierre de sesion, error de
+//! conexion y **perdida de foco del viewer**; este ultimo el host no puede detectarlo, asi
+//! que el viewer lo anuncia con `ReleaseAll` por el canal de input.
 
 #![deny(missing_docs)]
 
+pub mod captura;
 pub mod coords;
 pub mod error;
 pub mod estado;
 pub mod scancodes;
+
+#[cfg(windows)]
+pub mod captura_win32;
 
 #[cfg(windows)]
 mod win32;
@@ -66,10 +94,14 @@ mod stub;
 
 use vhdesk_proto::MouseButton;
 
+pub use crate::captura::{MotivoDescarte, TeclaCapturada, TeclaCruda, decodificar};
 pub use crate::coords::{EscritorioVirtual, MonitorFisico, Normalizada, a_pixeles, normalizar};
 pub use crate::error::InputError;
 pub use crate::estado::{Liberacion, RegistroPulsaciones};
-pub use crate::scancodes::{TeclaSet1, hid_a_set1};
+pub use crate::scancodes::{TeclaSet1, hid_a_set1, set1_a_hid};
+
+#[cfg(windows)]
+pub use crate::captura_win32::{hook_de_mensajes, registrar_teclado};
 
 /// Inyecta eventos de raton y teclado en la maquina local.
 pub trait InputInjector {

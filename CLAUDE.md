@@ -52,7 +52,13 @@ arquitectura como referencia conceptual está bien; copiar código no.
 8. **Nunca** implementes instalación silenciosa, ocultación de proceso, persistencia
    encubierta, ni cualquier otra capacidad propia de un RAT. Si una petición mía va en
    esa dirección, recházala y dímelo.
-9. Todo `unsafe` lleva comentario `// SAFETY:` explicando por qué es correcto.
+9. **Captura de teclado acotada al foco.** La captura de teclado del viewer se hace con
+   Raw Input **sin `RIDEV_INPUTSINK`**, de modo que solo llegan pulsaciones mientras
+   nuestra ventana tiene el foco. Queda **PROHIBIDO** usar un hook global de bajo nivel
+   (`WH_KEYBOARD_LL` o equivalente), que capturaría el teclado de todo el sistema aunque el
+   foco esté en otra aplicación. Esa es la forma de un keylogger y choca de frente con el
+   invariante 8. Vive en `vhdesk-input/src/captura.rs` y en `captura_win32.rs`.
+10. Todo `unsafe` lleva comentario `// SAFETY:` explicando por qué es correcto.
 
 ### Deuda de seguridad abierta que la Fase 2 tiene que cerrar
 
@@ -80,7 +86,9 @@ crates/
   vhdesk-crypto/     Identidades, pinning TOFU, verificadores rustls, Argon2id.
   vhdesk-capture/    trait ScreenCapturer + impls por SO (DXGI / PipeWire+X11 / SCK).
   vhdesk-codec/      traits VideoEncoder/Decoder + backends SW y HW.
-  vhdesk-input/      trait InputInjector + impls (SendInput / uinput / CGEvent).
+  vhdesk-input/      Entrada en las dos direcciones: trait InputInjector para inyectar en
+                     el host (SendInput / uinput / CGEvent) y captura de teclado en el
+                     viewer (Raw Input). Comparten la tabla HID <-> conjunto 1.
   vhdesk-audio/      Captura y salida con cpal, códec Opus.
   vhdesk-transport/  QUIC (quinn), hole punching, relay, congestión, priorización.
   vhdesk-host/       Daemon: capture → codec → transport; input → injector.
@@ -881,6 +889,127 @@ vídeo se dibuja únicamente dentro de su viewport y lo de alrededor es el fondo
 **Qué NO se hizo.** El camino de input (E3) y el dibujado del cursor. La posición del cursor
 remoto ya se recibe y se guarda, pero no se pinta: el cursor local ya se ve encima de la
 ventana y pintar el remoto sin su forma real daría dos punteros.
+
+### 2026-08-18 — Fase 1, bloque E3: el camino de entrada
+
+**Qué se hizo.** El viewer captura teclado y ratón, los traduce y los envía; el host suelta
+lo hundido cuando se lo piden; y el cursor remoto ya se dibuja.
+
+**El teclado NO puede venir de egui, y esto se verificó antes de planificar.** Tres motivos
+que se acumulan y que se comprobaron leyendo egui y egui-winit 0.32.3, no suponiendo:
+
+- `egui::Key` **no tiene variantes de modificador** y `key_from_key_code` no traduce
+  `ControlLeft`. Pulsar Ctrl a secas **no emite ningún evento**.
+- `egui::Modifiers` no distingue izquierdo de derecho, así que AltGr llegaría al host como
+  Alt izquierdo y dejaría de escribir la tercera fila de un teclado no-US.
+- `egui::Key` es con pérdida: `Enter | NumpadEnter → Key::Enter`, `Slash | NumpadDivide →
+  Key::Slash`.
+
+Y un cuarto que salió de regalo: egui-winit convierte Ctrl+C/X/V en `Event::Cut/Copy/Paste`
+y hace `return` **antes** de empujar el `Event::Key`. Como eso está dentro de `if pressed`,
+el host recibiría **una liberación huérfana sin su pulsación**.
+
+**La salida es Raw Input**, que entrega el scancode físico del conjunto 1 más la marca de
+extendida: exactamente el par que la tabla del bloque D sabe traducir sin perder nada. Se
+llega a `WM_INPUT` con `NativeOptions::event_loop_builder` + `with_msg_hook` de winit.
+
+**La tabla inversa no se transcribe: se deriva.** `set1_a_hid` recorre el dominio de
+`hid_a_set1` y devuelve el primer HID que coincide. Una segunda tabla escrita a mano serían
+cien líneas de datos duplicados que pueden discrepar en silencio, y el síntoma de una
+discrepancia es una tecla que escribe otra cosa. Cuesta ~110 comparaciones por pulsación,
+que al lado de mandar un mensaje por la red no se mide. Los tests comprueban **propiedades**
+en las dos direcciones sobre toda la tabla, más el barrido de los 256 scancodes por los dos
+estados de la marca. La única excepción es HID 0x32, alias de 0x31 en la misma tecla física,
+y está fijada como constante en el test para que sea explícita.
+
+**Los casos raros de `RAWKEYBOARD`, todos en un sitio y testeados en puro**: `RI_KEY_BREAK`
+es la liberación (el `MakeCode` **no** lleva el bit de ruptura, que es el error natural aquí);
+`RI_KEY_E0` es la marca de extendida; `RI_KEY_E1` solo lo usa Pausa y se descarta —el 0x1D
+con E1 parece Ctrl, así que mirarlo **después** de la tabla inyectaría un Ctrl fantasma—; el
+shift falso de ImprPant (`E0 2A` delante de `E0 37`) se filtra explícitamente; y `VKey ==
+0xFF` o `MakeCode == 0` son relleno. Las constantes `RI_KEY_*` **no están proyectadas por el
+crate `windows`** aunque sí lo esté `RAWKEYBOARD`: se declaran con su valor de ABI, igual que
+se hizo con `MONITORINFOF_PRIMARY` en el bloque A.
+
+**El hook no se traga nada.** winit documenta el valor de retorno como "true desactiva el
+despacho interno", así que se devuelve **siempre `false`**. Por ahí pasan todos los mensajes
+de la ventana, y lo único que hace por mensaje es comparar `message != WM_INPUT` y salir.
+
+**El puntero crudo no sale de `vhdesk-input`.** El viewer tiene `#![forbid(unsafe_code)]`, así
+que la API no expone una función que reciba el `*const c_void`: expone el **cierre entero ya
+construido**, que el viewer le pasa a winit sin tocar su contenido.
+
+**El orden entre teclado y ratón, que era el agujero de verdad.** Son dos caminos distintos
+—el teclado por el hook y un `mpsc`, el ratón por los eventos de egui en el `update`— y nada
+garantiza el orden relativo. Eso rompe Ctrl+clic, Mayús+clic y arrastrar con modificador. La
+regla es: **en cada frame se drena primero el teclado y se envía en orden, y solo después se
+procesa y se envía el ratón.** Queda una limitación escrita: el orden exacto **dentro de un
+mismo frame** no está garantizado entre los dos caminos. La salida conocida, si algún día
+molesta, es que el hook observe también los mensajes de ratón y lleve un contador de orden
+común; hoy no se hace.
+
+**`ReleaseAll` (tag 0x0c) y `PROTOCOL_VERSION` a 3.** Va por el canal de **input**, no por
+control: por control sería otro stream, y QUIC no ordena entre streams, así que podría
+adelantar a la tecla que venía a soltar. El host lo atiende **sin terminar la sesión** —perder
+el foco es cotidiano— con un test de loopback que comprueba que después del `ReleaseAll`
+siguen inyectándose teclas. Rompe con los binarios de E2, y falla limpio en el `Hello`.
+
+**Dos casos de "pegado" que no son el teclado y que también hay que cerrar**: la liberación de
+un botón del ratón **se envía caiga donde caiga**, incluso sobre una banda negra, porque
+suprimirla dejaría el botón hundido en la máquina remota; y una liberación cuya pulsación se
+suprimió (por haber ocurrido sobre la banda) **no se inventa**. El traductor lleva la cuenta.
+
+**Cada botón lleva delante el movimiento a su propio punto**, no a la posición final del
+frame: si no, un arrastre rápido pulsaría donde no era. Las posiciones sí se fusionan a una
+por frame, y una posición repetida no se reenvía.
+
+**Al perder el foco se olvida también la última posición enviada**, no solo los botones:
+mientras no mirábamos, el cursor remoto ha podido moverlo otro, y al volver hay que reenviarla
+aunque el ratón local no se haya movido.
+
+**El cursor remoto se dibuja donde dice el host, no donde está el ratón local.** Pintarlo bajo
+el puntero local se vería siempre perfecto y sería mentir: una divergencia entre los dos es el
+único síntoma visible de que el camino de entrada está fallando. Este sí pasa por el teselador
+de egui, y a propósito: son unos miles de píxeles una vez por frame.
+
+**El repintado ante tecla se pide, no se hereda.** Sin `RIDEV_NOLEGACY`, Windows manda también
+el `WM_KEYDOWN` normal y eso ya despierta a egui, así que la tecla se drenaría igual; pero
+depender de un efecto colateral para no perder pulsaciones es pedirlo por accidente. El hook
+llama a `request_repaint` a través de un `OnceLock` que rellena la clausura de creación.
+
+**La MSRV estaba rota otra vez, y esta vez la rompimos en E2.** `vhdesk-viewer/src/sesion.rs`
+tenía una let-chain (`if let ... && let ...`), estabilizada en 1.88. Reescrita como `if`
+anidados. Confirma que mover el job `msrv` a Windows valía la pena: en Linux no se compila
+nada de lo que hay tras `#[cfg(windows)]`.
+
+**Qué NO se hizo.** Ctrl+Alt+Supr no se captura y no se puede: es la secuencia de atención
+segura y ningún proceso de usuario la ve. Alt+Tab y la tecla Windows viajan al host **y**
+actúan localmente, porque no se usa `RIDEV_NOLEGACY` —que dejaría sin teclado a la propia
+interfaz del viewer—. Las dos cosas están documentadas en `vhdesk-input/src/lib.rs` junto a la
+limitación de distribución de teclado del bloque D, en vez de fingir que funcionan.
+
+**Trampa del loopback que hay que saber antes de probar en una sola máquina.** Si el viewer
+tiene el foco y el host inyecta en esa misma máquina, cada tecla se realimenta: el viewer la
+captura, la manda, el host la inyecta en la ventana con foco —que es el viewer— y vuelta a
+empezar, a velocidad de máquina. Con dos máquinas no pasa. En loopback, para probar el
+teclado hay que tener el host sirviendo un monitor distinto del que ocupa la ventana del
+viewer, o aceptar que la prueba de teclado se hace entre las dos máquinas.
+
+**Qué se verificó y qué no.** Mecánicamente, con la ventana llevada al primer plano desde un
+script: minimizar y que otra ventana robe el foco disparan los dos el `ReleaseAll`, y el host
+lo atiende **1 ms después** por loopback (`el viewer perdio el foco: soltado todo lo
+hundido`). Quedan para la prueba a mano **Alt+Tab** —que pasa por el mismo
+`WindowEvent::Focused(false)`, pero cuya parte interesante es que el Alt viaja justo antes y
+eso exige una pulsación física— y **bloquear la sesión de Windows**, que es el caso donde de
+verdad hay duda: no está garantizado que Windows entregue el evento de foco al cambiar al
+escritorio seguro.
+
+Para juzgar esa prueba, el resumen de cierre del viewer lleva ahora `eventos_entrada`. Sirve
+para distinguir "el host no reacciona" de "el viewer no está capturando nada", que desde la
+pantalla se ven igual y piden arreglos distintos.
+
+**Siguiente paso.** Bloque E4: la sesión entre las dos máquinas, y el informe de `--stats` del
+bloque F.
 
 ## Métricas actuales
 

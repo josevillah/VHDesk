@@ -12,7 +12,7 @@ use crate::message::{
     AudioFrame, AuthMethod, AuthRequest, AuthResponse, AuthResult, ClipboardFormat,
     ClipboardUpdate, Cursor, Hello, InputEvent, KeyframeReason, KeyframeRequest,
     MAX_ANNOUNCED_CODECS, MAX_PEER_NAME_LEN, Message, MouseButton, PROTOCOL_VERSION, Ping, Pong,
-    Role, VideoFrame,
+    ReleaseAll, Role, VideoFrame,
 };
 use crate::{ProtoError, message};
 
@@ -90,6 +90,7 @@ fn one_of_each() -> Vec<Message> {
             monitor: 0,
             reason: KeyframeReason::Gap,
         }),
+        Message::ReleaseAll(ReleaseAll),
         Message::Ping(Ping {
             nonce: 0xffff_ffff_ffff_ffff,
             sent_us: 1,
@@ -500,6 +501,34 @@ fn los_valores_del_wire_de_los_codecs_son_estables() {
         assert_eq!(codec.to_wire(), wire);
         assert_eq!(AudioCodec::from_wire(wire), Ok(codec));
     }
+}
+
+#[test]
+fn release_all_no_ocupa_cuerpo_pero_sigue_siendo_un_mensaje_valido() {
+    // Es una unidad: todo lo que lo identifica es el tag. Se comprueba explicitamente
+    // porque un cuerpo de longitud cero es justo la forma que tienen los frames vacios que
+    // el decodificador rechaza, y hay que asegurarse de que este no cae en esa rama.
+    let mut buf = BytesMut::new();
+    encode(&Message::ReleaseAll(ReleaseAll), &mut buf).expect("codificar");
+
+    assert_eq!(
+        buf.len(),
+        LENGTH_PREFIX_LEN + 1,
+        "prefijo mas tag, sin cuerpo: {buf:?}"
+    );
+    assert_eq!(decode(&mut buf), Ok(Some(Message::ReleaseAll(ReleaseAll))));
+    assert!(buf.is_empty(), "deberia haberse consumido entero");
+}
+
+#[test]
+fn release_all_no_admite_relleno_detras() {
+    // Un cuerpo con bytes de mas no es un ReleaseAll: rechazarlo evita que alguien cuele
+    // datos en un mensaje que por definicion no los lleva.
+    let mut buf = raw_frame(0x0c, &[0]);
+    assert!(
+        decode(&mut buf).is_err(),
+        "un ReleaseAll con cuerpo deberia rechazarse"
+    );
 }
 
 #[test]

@@ -49,6 +49,7 @@ const TAG_CLIPBOARD_UPDATE: u8 = 0x08;
 const TAG_PING: u8 = 0x09;
 const TAG_PONG: u8 = 0x0a;
 const TAG_KEYFRAME_REQUEST: u8 = 0x0b;
+const TAG_RELEASE_ALL: u8 = 0x0c;
 
 /// Bit de `flags` de [`VideoFrame`] que marca un keyframe.
 const VIDEO_FLAG_KEYFRAME: u8 = 0b0000_0001;
@@ -67,6 +68,7 @@ const fn tag_of(message: &Message) -> u8 {
         Message::Cursor(_) => TAG_CURSOR,
         Message::ClipboardUpdate(_) => TAG_CLIPBOARD_UPDATE,
         Message::KeyframeRequest(_) => TAG_KEYFRAME_REQUEST,
+        Message::ReleaseAll(_) => TAG_RELEASE_ALL,
         Message::Ping(_) => TAG_PING,
         Message::Pong(_) => TAG_PONG,
     }
@@ -109,6 +111,7 @@ fn encode_inner(message: &Message, out: &mut BytesMut) -> Result<(), ProtoError>
         Message::Cursor(cursor) => encode_control(cursor, out)?,
         Message::ClipboardUpdate(update) => encode_control(update, out)?,
         Message::KeyframeRequest(request) => encode_control(request, out)?,
+        Message::ReleaseAll(release) => encode_control(release, out)?,
         Message::Ping(ping) => encode_control(ping, out)?,
         Message::Pong(pong) => encode_control(pong, out)?,
         Message::VideoFrame(frame) => encode_video_frame(frame, out),
@@ -218,6 +221,7 @@ fn decode_body(body: &Bytes) -> Result<Message, ProtoError> {
         TAG_CURSOR => decode_control(&rest).map(Message::Cursor),
         TAG_CLIPBOARD_UPDATE => decode_control(&rest).map(Message::ClipboardUpdate),
         TAG_KEYFRAME_REQUEST => decode_control(&rest).map(Message::KeyframeRequest),
+        TAG_RELEASE_ALL => decode_control(&rest).map(Message::ReleaseAll),
         TAG_PING => decode_control(&rest).map(Message::Ping),
         TAG_PONG => decode_control(&rest).map(Message::Pong),
         other => Err(ProtoError::UnknownTag { tag: other }),

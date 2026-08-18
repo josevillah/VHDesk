@@ -22,7 +22,9 @@ use crate::codecs::{AudioCodec, VideoCodec};
 /// - **2**: `VideoFrame` gana `sequence`, y se anade `KeyframeRequest`. Sin el numero de
 ///   secuencia el receptor no puede saber que le falta un frame, y con un stream por frame
 ///   los huecos son el camino normal de degradacion, no una excepcion.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// - **3**: se anade [`ReleaseAll`]. Sin el, una tecla que estaba hundida cuando el viewer
+///   pierde el foco se queda hundida en la maquina remota para siempre.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Numero maximo de codecs que un peer puede anunciar en su `Hello`.
 ///
@@ -347,6 +349,25 @@ pub struct KeyframeRequest {
     pub reason: KeyframeReason,
 }
 
+/// Suelta en el host todo lo que el viewer tenga hundido.
+///
+/// # Por que existe y por que viaja por el canal de input
+///
+/// Si el viewer pierde el foco, se minimiza, se cierra o se le cae la conexion con una
+/// tecla pulsada, el host se queda con esa tecla hundida **para siempre**. Con Ctrl o Alt
+/// la maquina remota queda practicamente inservible, y el sintoma aparece *despues* de que
+/// la sesion terminara, asi que nadie lo relaciona con la causa.
+///
+/// El caso que mejor lo ilustra es Alt+Tab: el Alt viaja al host justo antes de que la
+/// ventana del viewer pierda el foco, asi que el `ReleaseAll` que viene detras es lo unico
+/// que evita dejar un Alt hundido al otro lado.
+///
+/// Va por el **canal de input** y no por el de control para que quede ordenado detras de la
+/// ultima pulsacion. Por control seria un stream distinto, y QUIC no ordena entre streams:
+/// podria adelantar a la tecla que venia a soltar y dejarla hundida igualmente.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseAll;
+
 /// Sonda de latencia.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ping {
@@ -387,6 +408,8 @@ pub enum Message {
     ClipboardUpdate(ClipboardUpdate),
     /// Ver [`KeyframeRequest`].
     KeyframeRequest(KeyframeRequest),
+    /// Ver [`ReleaseAll`].
+    ReleaseAll(ReleaseAll),
     /// Ver [`Ping`].
     Ping(Ping),
     /// Ver [`Pong`].
@@ -406,6 +429,7 @@ impl Message {
             Self::Cursor(_) => "Cursor",
             Self::ClipboardUpdate(_) => "ClipboardUpdate",
             Self::KeyframeRequest(_) => "KeyframeRequest",
+            Self::ReleaseAll(_) => "ReleaseAll",
             Self::Ping(_) => "Ping",
             Self::Pong(_) => "Pong",
         }

@@ -16,7 +16,17 @@
 //!
 //! Por eso el runtime es de un solo hilo: el decodificador de libvpx no es `Send`, y el
 //! bucle de video se ejecuta con `block_on` en vez de `spawn` precisamente para que no
-//! tenga que serlo. Las tareas que si son `Send` (control y datagramas) se lanzan aparte.
+//! tenga que serlo. Las tareas que si son `Send` (control, datagramas y entrada) se lanzan
+//! aparte.
+//!
+//! # La entrada va en sentido contrario
+//!
+//! La interfaz no puede esperar a la red dentro de `update`, asi que empuja los eventos ya
+//! traducidos a una cola y sigue pintando; una tarea del runtime los saca y los escribe en
+//! el stream de input. La cola **no tiene tope** a proposito: los eventos de entrada son
+//! diminutos y llegan como mucho unas decenas por segundo, y descartar una liberacion de
+//! tecla por cola llena es exactamente el fallo que `ReleaseAll` existe para evitar. Si la
+//! red se para, quien se llena no es la cola sino el buffer de QUIC, y la sesion termina.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +43,13 @@ use vhdesk_transport::{
 };
 
 use crate::video::{I420Planes, VideoRenderer};
+
+/// Cola por la que la interfaz manda entrada al hilo de sesion.
+///
+/// Acepta `Message` y no `InputEvent` porque por el canal de input viaja tambien
+/// `ReleaseAll`, que no es un evento a inyectar sino una orden sobre el estado de la
+/// sesion.
+pub type EmisorEntrada = tokio::sync::mpsc::UnboundedSender<Message>;
 
 /// Codecs que este viewer sabe decodificar, en orden de preferencia.
 const CODECS: &[VideoCodec] = &[VideoCodec::Vp8];
@@ -89,6 +106,24 @@ impl Estado {
     }
 }
 
+/// Imagen del puntero remoto, tal y como la mando el host.
+///
+/// El alfa es transparencia normal, **sin premultiplicar**: es lo que produce la conversion
+/// de `vhdesk-capture` y lo que espera `ColorImage::from_rgba_unmultiplied`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormaCursor {
+    /// Anchura en pixeles.
+    pub width: u32,
+    /// Altura en pixeles.
+    pub height: u32,
+    /// Desplazamiento horizontal del punto activo dentro de la imagen.
+    pub hotspot_x: u32,
+    /// Desplazamiento vertical del punto activo dentro de la imagen.
+    pub hotspot_y: u32,
+    /// Pixeles RGBA, `width * height * 4` bytes.
+    pub rgba: Vec<u8>,
+}
+
 /// Posicion del cursor remoto, normalizada al rango 0..=1 del monitor servido.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CursorRemoto {
@@ -111,9 +146,17 @@ pub struct Compartido {
     renderer: Mutex<Option<VideoRenderer>>,
     dimensiones: Mutex<Option<(u32, u32)>>,
     cursor: Mutex<Option<CursorRemoto>>,
+    forma_cursor: Mutex<Option<FormaCursor>>,
+    /// Sube cada vez que llega una forma nueva.
+    ///
+    /// Es lo que le dice a la interfaz que tiene que rehacer la textura. Comparar las
+    /// imagenes pixel a pixel para averiguarlo costaria mas que subirla otra vez, y guardar
+    /// solo un `bool` perderia una forma si llegaran dos entre dos repintados.
+    version_forma: AtomicU64,
     frames: AtomicU64,
     huecos: AtomicU64,
     keyframes_pedidos: AtomicU64,
+    eventos_entrada: AtomicU64,
 }
 
 impl Compartido {
@@ -123,9 +166,12 @@ impl Compartido {
             renderer: Mutex::new(None),
             dimensiones: Mutex::new(None),
             cursor: Mutex::new(None),
+            forma_cursor: Mutex::new(None),
+            version_forma: AtomicU64::new(0),
             frames: AtomicU64::new(0),
             huecos: AtomicU64::new(0),
             keyframes_pedidos: AtomicU64::new(0),
+            eventos_entrada: AtomicU64::new(0),
         }
     }
 
@@ -149,13 +195,22 @@ impl Compartido {
     }
 
     /// Ultima posicion conocida del cursor remoto.
-    ///
-    /// Se guarda pero **todavia no se dibuja**: el cursor local ya se ve encima de la
-    /// ventana, y pintar tambien el remoto sin la forma real daria dos punteros. El dibujo
-    /// llega con la forma en el bloque E3.
-    #[allow(dead_code)] // lo estrena el dibujado del cursor en el bloque E3.
     pub fn cursor(&self) -> Option<CursorRemoto> {
         self.cursor.lock().ok().and_then(|c| *c)
+    }
+
+    /// Version de la forma del cursor: cambia cuando hay una imagen nueva que subir.
+    pub fn version_forma(&self) -> u64 {
+        self.version_forma.load(Ordering::Relaxed)
+    }
+
+    /// Ejecuta `f` con la ultima forma recibida, si hay alguna.
+    ///
+    /// Se pasa por referencia en vez de devolver una copia porque un puntero de 32x32 son
+    /// 4 KiB y la interfaz solo la necesita para construir la textura.
+    pub fn con_forma<T>(&self, f: impl FnOnce(&FormaCursor) -> T) -> Option<T> {
+        let guardia = self.forma_cursor.lock().ok()?;
+        guardia.as_ref().map(f)
     }
 
     /// Frames decodificados desde el inicio.
@@ -171,6 +226,20 @@ impl Compartido {
     /// Keyframes pedidos al host.
     pub fn keyframes_pedidos(&self) -> u64 {
         self.keyframes_pedidos.load(Ordering::Relaxed)
+    }
+
+    /// Eventos de entrada escritos en el stream, teclado y raton juntos.
+    ///
+    /// Es lo que permite distinguir en una prueba a mano "el host no reacciona" de "el
+    /// viewer no esta capturando nada", que se ven igual desde la pantalla y piden arreglos
+    /// completamente distintos.
+    pub fn eventos_entrada(&self) -> u64 {
+        self.eventos_entrada.load(Ordering::Relaxed)
+    }
+
+    /// Anota un evento de entrada enviado.
+    pub fn anotar_entrada(&self) {
+        self.eventos_entrada.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Ejecuta `f` con el renderer, si ya existe.
@@ -203,13 +272,22 @@ pub struct Gpu {
     pub formato: wgpu::TextureFormat,
 }
 
-/// Arranca la sesion en un hilo propio y devuelve el estado compartido.
+/// Arranca la sesion en un hilo propio y devuelve el estado compartido y la cola de entrada.
 ///
 /// No falla: los errores de conexion se reflejan en [`Estado::Terminada`] para que la
 /// ventana pueda mostrarlos, en vez de abortar antes de que haya nada que mirar.
-pub fn arrancar(destino: SocketAddr, gpu: Gpu, ctx: eframe::egui::Context) -> Arc<Compartido> {
+///
+/// La cola de entrada existe desde antes de que haya conexion. Lo que se meta en ella
+/// mientras se negocia se enviara en cuanto el stream este abierto; es una ventana de
+/// milisegundos durante la cual la ventana ensena "Conectando" y nadie esta escribiendo.
+pub fn arrancar(
+    destino: SocketAddr,
+    gpu: Gpu,
+    ctx: eframe::egui::Context,
+) -> (Arc<Compartido>, EmisorEntrada) {
     let compartido = Arc::new(Compartido::nuevo(destino));
     let para_hilo = Arc::clone(&compartido);
+    let (emisor_entrada, receptor_entrada) = tokio::sync::mpsc::unbounded_channel();
 
     std::thread::Builder::new()
         .name("vhdesk-sesion".to_owned())
@@ -232,7 +310,8 @@ pub fn arrancar(destino: SocketAddr, gpu: Gpu, ctx: eframe::egui::Context) -> Ar
                 }
             };
 
-            let resultado = runtime.block_on(sesion(destino, &gpu, &para_hilo, &ctx));
+            let resultado =
+                runtime.block_on(sesion(destino, &gpu, &para_hilo, &ctx, receptor_entrada));
 
             // Resumen al cerrar: es lo unico que queda de la sesion cuando la ventana ya
             // solo ensena el motivo, y es lo primero que se mira cuando algo fue mal.
@@ -240,6 +319,7 @@ pub fn arrancar(destino: SocketAddr, gpu: Gpu, ctx: eframe::egui::Context) -> Ar
                 frames = para_hilo.frames(),
                 huecos = para_hilo.huecos(),
                 keyframes_pedidos = para_hilo.keyframes_pedidos(),
+                eventos_entrada = para_hilo.eventos_entrada(),
                 "sesion terminada"
             );
 
@@ -257,7 +337,7 @@ pub fn arrancar(destino: SocketAddr, gpu: Gpu, ctx: eframe::egui::Context) -> Ar
         })
         .expect("no se pudo lanzar el hilo de sesion");
 
-    compartido
+    (compartido, emisor_entrada)
 }
 
 /// Cuerpo de la sesion.
@@ -266,6 +346,7 @@ async fn sesion(
     gpu: &Gpu,
     compartido: &Arc<Compartido>,
     ctx: &eframe::egui::Context,
+    receptor_entrada: tokio::sync::mpsc::UnboundedReceiver<Message>,
 ) -> Result<(), TransportError> {
     install_crypto_provider();
 
@@ -292,18 +373,24 @@ async fn sesion(
     compartido.keyframes_pedidos.fetch_add(1, Ordering::Relaxed);
     compartido.poner_estado(Estado::Esperando, ctx);
 
-    // Las dos tareas que si son `Send`.
-    let control_tarea = tokio::spawn(leer_control(receptor_control));
+    // Las tareas que si son `Send`.
+    let control_tarea = tokio::spawn(leer_control(
+        receptor_control,
+        Arc::clone(compartido),
+        ctx.clone(),
+    ));
     let datagramas = tokio::spawn(leer_datagramas(
         sesion.clone(),
         Arc::clone(compartido),
         ctx.clone(),
     ));
+    let entrada = tokio::spawn(enviar_entrada(sesion.clone(), receptor_entrada));
 
     let resultado = bucle_video(&sesion, gpu, compartido, ctx, codec, &mut emisor).await;
 
     control_tarea.abort();
     datagramas.abort();
+    entrada.abort();
     sesion.close();
     endpoint.wait_idle().await;
 
@@ -483,15 +570,61 @@ fn decodificar_y_subir(
     Ok(())
 }
 
+/// Escribe en el stream de input lo que la interfaz vaya dejando en la cola.
+///
+/// El orden de la cola es el orden del cable: el stream de input es fiable y ordenado, asi
+/// que un modificador encolado antes que su clic llega antes que su clic.
+async fn enviar_entrada(
+    sesion: Session,
+    mut receptor: tokio::sync::mpsc::UnboundedReceiver<Message>,
+) {
+    let mut emisor = match sesion.open_input().await {
+        Ok(emisor) => emisor,
+        Err(error) => {
+            tracing::warn!(%error, "no se pudo abrir el canal de entrada: la sesion sera de solo mirar");
+            return;
+        }
+    };
+
+    while let Some(mensaje) = receptor.recv().await {
+        if let Err(error) = emisor.send(&mensaje).await {
+            // La conexion se fue. No se insiste: el bucle de video vera el mismo error y es
+            // el que decide como termina la sesion.
+            tracing::debug!(%error, "termina el envio de entrada");
+            return;
+        }
+    }
+}
+
 /// Atiende el canal de control mientras dure la sesion.
-async fn leer_control(mut receptor: vhdesk_transport::ControlReceiver) {
+async fn leer_control(
+    mut receptor: vhdesk_transport::ControlReceiver,
+    compartido: Arc<Compartido>,
+    ctx: eframe::egui::Context,
+) {
     while let Ok(mensaje) = receptor.recv().await {
         match mensaje {
-            // FASE 1 (bloque E3): la forma del cursor se guarda y se dibuja. Llega por
-            // control y no por datagrama porque un puntero de 32x32 en RGBA son 4 KB y el
-            // maximo de datagrama medido son 1414 bytes.
-            Message::Cursor(Cursor::Shape { width, height, .. }) => {
+            // La forma llega por control y no por datagrama porque no cabe: un puntero de
+            // 32x32 en RGBA son 4 KiB y el maximo de datagrama medido son 1414 bytes.
+            Message::Cursor(Cursor::Shape {
+                hotspot_x,
+                hotspot_y,
+                width,
+                height,
+                rgba,
+            }) => {
                 tracing::debug!(width, height, "forma de cursor recibida");
+                if let Ok(mut forma) = compartido.forma_cursor.lock() {
+                    *forma = Some(FormaCursor {
+                        width: u32::from(width),
+                        height: u32::from(height),
+                        hotspot_x: u32::from(hotspot_x),
+                        hotspot_y: u32::from(hotspot_y),
+                        rgba,
+                    });
+                }
+                compartido.version_forma.fetch_add(1, Ordering::Relaxed);
+                ctx.request_repaint();
             }
             otro => tracing::debug!(mensaje = otro.name(), "mensaje de control"),
         }
@@ -512,17 +645,21 @@ async fn leer_datagramas(sesion: Session, compartido: Arc<Compartido>, ctx: efra
                 }
             }
             Message::Cursor(Cursor::Hidden) => {
-                if let Ok(mut cursor) = compartido.cursor.lock()
-                    && let Some(actual) = cursor.as_mut()
-                {
-                    actual.visible = false;
+                // Anidado y no encadenado con `&&`: las let-chains se estabilizaron en
+                // 1.88 y la MSRV de este workspace es 1.85. El job `msrv` del CI lo caza.
+                if let Ok(mut cursor) = compartido.cursor.lock() {
+                    if let Some(actual) = cursor.as_mut() {
+                        actual.visible = false;
+                    }
                 }
             }
             otro => tracing::trace!(mensaje = otro.name(), "datagrama"),
         }
-        // No se pide repintado: la posicion del cursor todavia no se dibuja, asi que
-        // despertar la interfaz por cada movimiento del raton remoto seria gastar por nada.
-        let _ = &ctx;
+        // El cursor si se dibuja, asi que hay que repintar. Es lo que hace que el puntero
+        // remoto se mueva sin esperar al siguiente frame de video, que es justamente por lo
+        // que viaja aparte. egui agrupa las peticiones, asi que un raton de 1000 Hz no
+        // produce mil repintados sino como mucho uno por refresco.
+        ctx.request_repaint();
     }
 }
 

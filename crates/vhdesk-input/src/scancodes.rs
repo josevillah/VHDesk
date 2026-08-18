@@ -1,4 +1,4 @@
-//! Traduccion de scancodes USB HID a scancodes PS/2 del conjunto 1.
+//! Traduccion entre scancodes USB HID y scancodes PS/2 del conjunto 1, en los dos sentidos.
 //!
 //! El protocolo lleva por el cable el **usage ID de la pagina de teclado de USB HID**
 //! (pagina 0x07), que es el identificador neutral de una tecla fisica. `SendInput` con
@@ -23,6 +23,22 @@
 //!
 //! Si la marca falta, el sintoma es sutil en vez de roto: en teclados no-US, AltGr deja de
 //! producir los caracteres de la tercera fila.
+//!
+//! # Las dos direcciones, y por que solo hay una tabla
+//!
+//! El host traduce HID -> conjunto 1 para inyectar con `SendInput`; el viewer traduce
+//! conjunto 1 -> HID, porque Raw Input le entrega el `MakeCode` del conjunto 1 y por el
+//! cable viaja HID. Son inversas exactas la una de la otra.
+//!
+//! **La inversa no se transcribe: se deriva.** [`set1_a_hid`] recorre el dominio de
+//! [`hid_a_set1`] y devuelve el primer HID cuya traduccion coincide. Una segunda tabla
+//! escrita a mano seria un centenar de lineas de datos duplicados que pueden discrepar en
+//! silencio, y el sintoma de una discrepancia es una tecla que escribe otra cosa. Derivarla
+//! hace que discrepar sea imposible, y deja a los tests comprobar **propiedades** en vez de
+//! la transcripcion.
+//!
+//! El coste es un barrido de ~110 comparaciones por tecla pulsada, que al lado de mandar un
+//! mensaje por la red no se mide.
 
 use crate::error::InputError;
 
@@ -196,13 +212,178 @@ pub const fn hid_a_set1(hid: u32) -> Result<TeclaSet1, InputError> {
     Ok(tecla)
 }
 
+/// Rangos de usage ID que la tabla de [`hid_a_set1`] puede reconocer.
+///
+/// No son "todas las teclas de HID": son el dominio que este crate traduce. Existen para
+/// que [`set1_a_hid`] sepa por donde barrer sin recorrer los 2^32 valores posibles de un
+/// `u32`.
+const DOMINIO_HID: [(u32, u32); 2] = [(0x04, 0x67), (0xE0, 0xE7)];
+
+/// Traduce un scancode del conjunto 1 al usage ID de HID que le corresponde.
+///
+/// Es la inversa de [`hid_a_set1`], y la usa el **viewer**: Raw Input entrega el `MakeCode`
+/// del conjunto 1 y por el cable viaja HID.
+///
+/// Devuelve `None` para los scancodes que esta tabla no reconoce. Quien llama debe
+/// **descartar** la tecla, no aproximarla: enviar una tecla parecida escribe en la maquina
+/// remota algo que nadie pidio.
+///
+/// # Las dos teclas que comparten scancode
+///
+/// HID 0x31 (la barra invertida) y 0x32 (la almohadilla de los teclados no-US) son la misma
+/// tecla fisica y la tabla las manda las dos al `0x2B` normal, asi que la inversa tiene que
+/// elegir. Elige **0x31**, que es la que produce cualquier teclado real: 0x32 solo aparece
+/// en descripciones de HID que distinguen variantes de serigrafia. El host las inyecta
+/// identicas, asi que la eleccion no cambia lo que se escribe al otro lado.
+pub fn set1_a_hid(tecla: TeclaSet1) -> Option<u32> {
+    // Barrido ascendente sobre el dominio. Ascendente **importa**: es lo que hace que el
+    // empate 0x31/0x32 se resuelva por 0x31, y no por el orden en que estuvieran escritas
+    // las ramas del `match`.
+    for (desde, hasta) in DOMINIO_HID {
+        for hid in desde..=hasta {
+            if let Ok(candidata) = hid_a_set1(hid) {
+                if candidata == tecla {
+                    return Some(hid);
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::hid_a_set1;
+    use super::{DOMINIO_HID, TeclaSet1, hid_a_set1, set1_a_hid};
     use crate::error::InputError;
 
     fn tecla(hid: u32) -> super::TeclaSet1 {
         hid_a_set1(hid).expect("la tecla deberia estar en la tabla")
+    }
+
+    /// El unico HID cuya ida y vuelta no es la identidad, y por que.
+    ///
+    /// 0x31 y 0x32 son la misma tecla fisica y la tabla las manda al mismo scancode, asi
+    /// que la inversa tiene que elegir una. Se fija aqui para que la excepcion sea
+    /// explicita en vez de un caso que alguien descubra fallando.
+    const ALIAS: (u32, u32) = (0x32, 0x31);
+
+    #[test]
+    fn la_traduccion_de_ida_y_vuelta_devuelve_la_misma_tecla() {
+        // Recorre **toda** la tabla, no una muestra: es lo unico que garantiza que las dos
+        // direcciones no puedan discrepar. Una discrepancia no da error, da una tecla que
+        // escribe otra cosa.
+        let mut recorridas = 0;
+
+        for (desde, hasta) in DOMINIO_HID {
+            for hid in desde..=hasta {
+                let Ok(tecla) = hid_a_set1(hid) else {
+                    continue;
+                };
+                recorridas += 1;
+
+                let vuelta = set1_a_hid(tecla).unwrap_or_else(|| {
+                    panic!("HID 0x{hid:02x} traduce a {tecla:?} pero la inversa no lo reconoce")
+                });
+
+                let esperado = if hid == ALIAS.0 { ALIAS.1 } else { hid };
+                assert_eq!(
+                    vuelta, esperado,
+                    "HID 0x{hid:02x} -> {tecla:?} -> 0x{vuelta:02x}"
+                );
+            }
+        }
+
+        assert!(
+            recorridas > 100,
+            "solo se recorrieron {recorridas} teclas: el dominio se ha quedado corto"
+        );
+    }
+
+    #[test]
+    fn todo_scancode_reconocido_vuelve_a_si_mismo() {
+        // La direccion contraria, y la que de verdad usa el viewer: barrido de los 256
+        // scancodes por los dos estados de la marca de extendida. Todo lo que la inversa
+        // reconozca tiene que traducir de vuelta al **mismo par**, marca incluida.
+        let mut reconocidos = 0;
+
+        for scancode in 0..=0xFFu16 {
+            for extendida in [false, true] {
+                let tecla = TeclaSet1 {
+                    scancode,
+                    extendida,
+                };
+                let Some(hid) = set1_a_hid(tecla) else {
+                    continue;
+                };
+                reconocidos += 1;
+
+                let vuelta = hid_a_set1(hid).expect("la inversa devolvio un HID fuera de la tabla");
+                assert_eq!(
+                    vuelta, tecla,
+                    "{tecla:?} -> HID 0x{hid:02x} -> {vuelta:?}: la marca de extendida o el                      scancode cambiaron por el camino"
+                );
+            }
+        }
+
+        assert!(
+            reconocidos > 100,
+            "solo se reconocieron {reconocidos} pares: la inversa se ha quedado corta"
+        );
+    }
+
+    #[test]
+    fn los_modificadores_izquierdo_y_derecho_no_se_confunden_al_volver() {
+        // El caso que justifica que la marca viaje con el scancode, visto desde la inversa:
+        // el mismo 0x1D tiene que dar Ctrl izquierdo o derecho segun la marca. Si esto se
+        // rompe, AltGr llega al host como Alt izquierdo y deja de escribir la tercera fila.
+        for (scancode, izquierdo, derecho) in [(0x1D, 0xE0, 0xE4), (0x38, 0xE2, 0xE6)] {
+            assert_eq!(
+                set1_a_hid(TeclaSet1 {
+                    scancode,
+                    extendida: false
+                }),
+                Some(izquierdo)
+            );
+            assert_eq!(
+                set1_a_hid(TeclaSet1 {
+                    scancode,
+                    extendida: true
+                }),
+                Some(derecho)
+            );
+        }
+    }
+
+    #[test]
+    fn un_scancode_que_no_existe_no_se_aproxima() {
+        for tecla in [
+            // El shift falso que Windows inyecta delante de Impr Pant: 0x2A **con** E0. La
+            // tecla real es 0x2A sin marca, asi que este par no esta en la tabla y la
+            // inversa no debe inventarselo.
+            TeclaSet1 {
+                scancode: 0x2A,
+                extendida: true,
+            },
+            // La tecla Windows solo existe como extendida.
+            TeclaSet1 {
+                scancode: 0x5B,
+                extendida: false,
+            },
+            TeclaSet1 {
+                scancode: 0x00,
+                extendida: false,
+            },
+            TeclaSet1 {
+                scancode: 0xFF,
+                extendida: true,
+            },
+        ] {
+            assert_eq!(
+                set1_a_hid(tecla),
+                None,
+                "{tecla:?} deberia descartarse: enviar una tecla parecida escribe en la                  maquina remota algo que nadie pidio"
+            );
+        }
     }
 
     #[test]

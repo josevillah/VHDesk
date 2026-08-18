@@ -12,8 +12,8 @@
 //!   donde estan la X de cerrar y las esquinas activas.
 //!
 //! Modulo puro y sin dependencias graficas: se testea entero en CI, incluso donde no hay
-//! GPU. Es tambien el contrato que cumple el bloque E3, porque `vhdesk-input` recibe
-//! pixeles fisicos del escritorio remoto y **no** coordenadas de esta ventana.
+//! GPU. Es tambien el contrato con `vhdesk-input`, que recibe pixeles fisicos del escritorio
+//! remoto y **no** coordenadas de esta ventana.
 
 /// Rectangulo donde se pinta el video, en pixeles fisicos de la ventana.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -47,8 +47,6 @@ impl Encuadre {
     /// El borde derecho e inferior quedan **excluidos**: con `ancho` de 800, las x validas
     /// van de 0 a 799,99. Incluirlos daria un pixel remoto fuera de rango justo en el
     /// borde, que es donde mas se hace clic.
-    // Lo usa `a_pixel_remoto`, y con el llegara el bloque E3 al traducir el raton.
-    #[allow(dead_code)]
     pub fn contiene(&self, x: f32, y: f32) -> bool {
         !self.esta_vacio()
             && x >= self.x
@@ -94,10 +92,6 @@ pub fn encuadrar(video: (u32, u32), ventana: (f32, f32)) -> Encuadre {
 ///
 /// El resultado esta acotado a `0..=ancho-1` y `0..=alto-1`, asi que nunca senala un pixel
 /// que no exista.
-// FASE 1 (bloque E3): lo estrena la captura de raton del viewer. Se escribe y se testea
-// ahora porque es la mitad inversa del encuadre y separarlas invitaria a que dejaran de
-// cuadrar.
-#[allow(dead_code)]
 pub fn a_pixel_remoto(
     punto: (f32, f32),
     encuadre: &Encuadre,

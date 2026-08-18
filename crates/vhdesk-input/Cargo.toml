@@ -1,6 +1,6 @@
 [package]
 name = "vhdesk-input"
-description = "Inyeccion de teclado y raton multiplataforma tras un trait comun."
+description = "Captura de teclado en el viewer e inyeccion de teclado y raton en el host."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

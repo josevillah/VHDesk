@@ -76,6 +76,13 @@ eframe = { version = "0.32.3", default-features = false, features = ["wgpu", "de
 # ejecucion, no un error de compilacion: de esas que cuestan una tarde entera. Declarar
 # `egui-wgpu` aqui con sus features por defecto devuelve `wgpu/default` al arbol.
 egui-wgpu = "0.32.3"
+
+# Solo para llegar a `EventLoopBuilderExtWindows::with_msg_hook`, que es por donde el viewer
+# ve los `WM_INPUT` de Raw Input. Se pasa por `egui-winit` y no por `winit` a pelo para que
+# la version sea forzosamente la misma que usa eframe: si el arbol se partiera en dos winit,
+# el `EventLoopBuilder` que espera eframe y el que tendriamos aqui serian tipos distintos y
+# el error saldria como un desajuste de tipos incomprensible.
+egui-winit = "0.32.3"
 pollster = "1.0.1"
 
 windows = { version = "0.62.2", features = [
@@ -87,6 +94,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Gdi",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
+    "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

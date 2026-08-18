@@ -26,6 +26,15 @@ pub enum InputError {
         hid: u32,
     },
 
+    /// Windows rechazo el registro de la captura de teclado con Raw Input.
+    ///
+    /// Sin captura el viewer puede seguir viendo la pantalla remota y usando el raton, asi
+    /// que quien llama decide si degrada o aborta. Lo que **no** debe hacer es caer en un
+    /// hook global de bajo nivel como respaldo: ver el invariante de seguridad en
+    /// [`crate::captura`].
+    #[error("no se pudo registrar la captura de teclado: {0}")]
+    RegistroDeCaptura(String),
+
     /// No se pudieron obtener las dimensiones del escritorio virtual.
     #[error("no se pudo consultar la geometria del escritorio virtual")]
     EscritorioDesconocido,
