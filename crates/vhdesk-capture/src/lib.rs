@@ -5,8 +5,8 @@
 //! operativo.
 //!
 //! - Windows: DXGI Desktop Duplication.
-//! - Linux: portal PipeWire ScreenCast, con X11 XShm como respaldo. FASE 1b.
-//! - macOS: ScreenCaptureKit. FASE 1b.
+//! - Linux: portal PipeWire ScreenCast, con X11 XShm como respaldo. FASE 8.
+//! - macOS: ScreenCaptureKit. FASE 8.
 //!
 //! Este crate hace FFI, asi que puede contener `unsafe`, siempre con un comentario
 //! `// SAFETY:` que explique por que la llamada es correcta.

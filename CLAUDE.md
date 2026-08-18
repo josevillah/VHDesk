@@ -14,9 +14,14 @@ formato Conventional Commits. Nada más.
 
 ## Qué es VHDesk
 
-Sistema de escritorio remoto libre (GPL-3.0 / servidor AGPL-3.0), escrito en Rust,
-multiplataforma (Windows 10+, Linux X11/Wayland, macOS 13+) y autohospedable.
-Equivalente funcional a AnyDesk/RustDesk, escrito desde cero.
+Sistema de escritorio remoto libre (GPL-3.0 / servidor AGPL-3.0), escrito en Rust y
+autohospedable. Equivalente funcional a AnyDesk/RustDesk, escrito desde cero.
+
+**Diseñado multiplataforma, entregado primero en Windows.** El objetivo sigue siendo Windows
+10+, Linux X11/Wayland y macOS 13+, y por eso captura, input y audio viven detrás de traits
+con los stubs de las otras plataformas compilando. Pero **la v1.0 es solo Windows**: las
+fases 1 a 7 se completan ahí y la portabilidad es la fase 8. Ver
+[ADR-0003](docs/adr/0003-windows-primero.md).
 
 Flujo del producto: el host muestra un ID + contraseña. El viewer introduce ese ID,
 el servidor de rendezvous coordina un hole punch UDP (relay como fallback) y se
@@ -253,16 +258,34 @@ encode con y sin él.
 
 ## Estado de las fases
 
+**Alcance: Windows primero en profundidad.** Las fases 1 a 7 se completan **solo para
+Windows**, hasta tener un producto instalable y usable a diario; Linux y macOS son la fase 8.
+Ver [ADR-0003](docs/adr/0003-windows-primero.md), que explica también por qué los stubs de
+las otras plataformas **no se borran** y por qué la CI sigue corriendo en los tres sistemas.
+
 | Fase | Descripción | Estado |
 |---|---|---|
 | 0 | Workspace, protocolo base, CI, licencias | ✅ hecha |
 | 1 | MVP en LAN: vídeo + input | ⬜ pendiente |
 | 2 | Autenticación, consentimiento, auditoría, pinning | ⬜ pendiente |
 | 3 | Rendezvous, NAT traversal, relay, self-hosting | ⬜ pendiente |
-| 4 | Rendimiento: HW encode, dirty rects, bitrate adaptativo | ⬜ pendiente |
+| 4 | Rendimiento: HW encode, dirty rects, bitrate adaptativo · **+ spike de X11** | ⬜ pendiente |
 | 5 | Multi-monitor, portapapeles, archivos, audio, chat | ⬜ pendiente |
-| 6 | Servicios, instaladores, firma, actualizaciones | ⬜ pendiente |
+| 6 | Servicios, instaladores, firma, actualizaciones (**solo Windows**) | ⬜ pendiente |
 | 7 | Fuzzing, sandboxing, auditoría, SECURITY.md | ⬜ pendiente |
+| 8 | **Portabilidad**: captura, input, audio y empaquetado en Linux (X11/Wayland) y macOS | ⬜ pendiente |
+
+### Spike de X11 al final de la fase 4: la salvaguarda del ADR-0003
+
+Un día, con límite duro. **No es una plataforma soportada**: es la prueba de que
+`ScreenCapturer` e `InputInjector` no se han convertido en envoltorios de DXGI y `SendInput`
+con nombre genérico. X11 se elige por ser la más simple —XShm y XTest, sin portales ni
+permisos—, de modo que lo que falle sea un fallo del **diseño del trait** y no del entorno.
+
+Y no es un riesgo hipotético: hoy ya hay filtraciones en tipos que se presentan como
+neutrales. `Frame::presented_at_qpc` son literalmente unidades del contador de Windows, y
+`MonitorId { adapter, output }` tiene la forma de DXGI y en X11 no significa nada. El ADR
+lleva la lista de preguntas concretas que el spike tiene que responder.
 
 ## Decisiones tomadas
 
@@ -279,10 +302,17 @@ encode con y sin él.
   x64 mide 32 bits en vez de 64, y eso desplaza todos los campos posteriores dentro de las
   estructuras. libvpx por vcpkg en Windows (`vcpkg.json`, triplete `x64-windows-static-md`)
   y por el paquete del sistema en Linux y macOS. Compilar exige libvpx y LLVM.
+- **ADR-0003** — [Windows primero en profundidad](docs/adr/0003-windows-primero.md). Las
+  fases 1 a 7 se completan solo para Windows; Linux y macOS pasan a una fase 8. Las fases 2
+  y 3 son casi independientes de plataforma, así que lo que se aplaza es sobre todo captura,
+  input, audio y empaquetado, y a cambio no se paga el modelo de permisos de Wayland ni la
+  firma de macOS mientras el diseño se mueve. Los stubs siguen compilando y la CI sigue en
+  tres sistemas. Salvaguarda: spike de X11 acotado a un día al final de la fase 4.
 
 ## Riesgos abiertos y minas conocidas
 
-Anotados en la fase 0 para que no sorprendan después:
+Anotados en la fase 0 para que no sorprendan después. **Los de Linux y macOS pasan a la
+fase 8 por el ADR-0003, pero se quedan escritos aquí: aplazar no es olvidar.**
 
 - **Wayland y modo desatendido.** El portal PipeWire exige consentimiento interactivo. El
   token de restauración ayuda pero depende del compositor. Es un problema abierto de

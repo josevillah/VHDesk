@@ -1,7 +1,7 @@
 //! Inyeccion de entrada en el host.
 //!
 //! Expone el trait [`InputInjector`] y esconde detras de `#[cfg]` las implementaciones por
-//! sistema: `SendInput` en Windows, y `uinput` y `CGEvent` en la fase 1b.
+//! sistema: `SendInput` en Windows, y `uinput` y `CGEvent` en la fase 8.
 //!
 //! Este crate hace FFI, asi que puede contener `unsafe` con `// SAFETY:`.
 //!
